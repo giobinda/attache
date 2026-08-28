@@ -13,6 +13,31 @@ prompt (over SSH, headless), unapproved access is denied by default.
 The vault auto-closes after 5 minutes idle, at logout or shutdown, and before
 suspend.
 
+## The name
+
+An *attaché case* is the slim, locked briefcase a diplomatic attaché uses to
+carry sensitive papers between postings: the documents are protected in transit
+and only opened by the right hands. That is the whole idea here — a small locked
+case for your private files that travels with you and checks who is reaching
+inside.
+
+## What it's for: portable privacy
+
+The vault is one self-contained encrypted directory. It does not depend on the
+host machine — no system configuration, no database, no service to register:
+
+- `att export` burns the encrypted vault **plus the tools to open it** to a disc,
+  with a `MANIFEST.sha256` over every file. `attache-import` restores it,
+  verified, onto any Linux machine with nothing preinstalled.
+- The access policy — the per-binary prompts and the SHA-256 whitelist — lives
+  *inside* the vault's own backing directory, so it travels with the data. Your
+  rules about which programs may read your files are enforced on the new machine
+  too, not left behind on the old one.
+
+So your private working set — notes, keys, documents — moves with you: encrypted
+at rest, gated per application, on machines you did not have to set up or trust
+in advance.
+
 > **Status:** early, single-author project. It performs privileged mount
 > operations — read the code and the [threat model](#threat-model) before
 > trusting it with anything that matters.
@@ -43,6 +68,31 @@ suspend.
 `att open` collects the gocryptfs password on a real terminal, then hands off to
 a single background manager process that owns both mounts (gocryptfs and
 `attache-gate`) for as long as the vault is open.
+
+## Secure notes: `att note`
+
+```sh
+att note                 # new note named for the current time: 20260828-153000.vnote
+att note ideas.md        # or a name you choose (relative path, no '..')
+```
+
+`att note` opens `$VISUAL` / `$EDITOR` (default `vim`) on a file **inside the
+vault**. If the vault is closed it opens it first and closes it again when you
+are done. The note's contents go straight into gocryptfs — encrypted at rest
+like everything else in the vault — and nothing about it is written anywhere
+outside.
+
+**No history, no backups, no leakage:**
+
+- The editor runs with `HOME` and every `XDG_*` directory redirected to a
+  throwaway sandbox under `/dev/shm` (RAM, never written to disk), which is
+  deleted the moment the editor exits. Your real home never sees the editor's
+  swap files, undo history, `.viminfo`, recent-files list, or config.
+- Attaché keeps no versioning, no snapshots, and no trash. Overwrite a note and
+  the previous contents are gone.
+- The encrypted vault is the **only** copy of your notes unless you make one
+  yourself with `att export`. `att oblivion` — which shreds the key material and
+  deletes the payload — is genuinely irreversible.
 
 ## Threat model
 
