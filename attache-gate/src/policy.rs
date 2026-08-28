@@ -64,7 +64,16 @@ impl<P: Prompter> AuthPolicy<P> {
         // access from the same already-verified whitelisted binary isn't
         // actually free - it re-hashes the file - but it's the only way
         // this guarantee holds every time, not just on first use).
-        if self.whitelist.lock().unwrap().is_allowed(identity) {
+        // Split-lock: take only the recorded hash string under the lock,
+        // then release it before re-hashing the (possibly large) caller
+        // binary to compare. Holding `whitelist` across `hash_file` would
+        // serialise every gated access in the vault behind one multi-MB
+        // read+SHA256 - and the control socket (`control.rs`) wants this
+        // same lock too.
+        let expected = self.whitelist.lock().unwrap().expected_sha256(&identity.path);
+        if let Some(expected) = expected
+            && matches!(crate::whitelist::hash_file(&identity.path), Ok(h) if h == expected)
+        {
             return Decision::Allow;
         }
 
@@ -166,21 +175,57 @@ fn dialog_text(identity: &ProcessIdentity, target: &Path) -> String {
     )
 }
 
-/// Prompts the user via a `zenity` GUI dialog. Fails closed (Deny) if zenity
-/// is missing or errors, since this is a security gate — the GUI launch
-/// itself isn't unit-tested here (it opens a real dialog), but the dialog
-/// text is built by `dialog_text`/`escape_markup`, which are tested below;
-/// the caching/decision logic it all feeds into is covered by the
-/// `AuthPolicy` tests above.
+/// Whether there's any plausible way to show a GUI dialog right now.
+/// zenity is a GTK app: with no session bus *and* no display it doesn't
+/// fail fast, it can block indefinitely in D-Bus autolaunch - which, on a
+/// single call path feeding a security gate, is worse than a clean denial.
+/// So if none of these are set we skip zenity entirely and fail closed.
+fn gui_env_available(var: impl Fn(&str) -> Option<String>) -> bool {
+    let set = |k: &str| var(k).map(|v| !v.is_empty()).unwrap_or(false);
+    set("DBUS_SESSION_BUS_ADDRESS") || set("DISPLAY") || set("WAYLAND_DISPLAY")
+}
+
+/// Seconds a prompt may sit unanswered before it auto-denies. Keeps a
+/// worker thread from being pinned forever by a dialog nobody sees or
+/// answers. Override with `ATTACHE_PROMPT_TIMEOUT`.
+fn prompt_timeout_secs() -> u32 {
+    std::env::var("ATTACHE_PROMPT_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120)
+}
+
+/// Prompts the user via a `zenity` GUI dialog. Fails closed (Deny) if there's
+/// no GUI session, if zenity is missing or errors, or if the dialog goes
+/// unanswered past the timeout — since this is a security gate. The GUI
+/// launch itself isn't unit-tested here (it opens a real dialog), but
+/// `gui_env_available` and the dialog text (`dialog_text`/`escape_markup`)
+/// are tested below, and the caching/decision logic it feeds is covered by
+/// the `AuthPolicy` tests above.
 pub struct ZenityPrompter;
 
 impl Prompter for ZenityPrompter {
     fn ask(&self, identity: &ProcessIdentity, target: &Path) -> PromptResponse {
+        if !gui_env_available(|k| std::env::var(k).ok()) {
+            // No dialog can be shown - and trying anyway risks hanging this
+            // worker in GTK's D-Bus autolaunch. This is the case
+            // `att allow --always <path>` exists to work around.
+            log::warn!(
+                "no GUI session (DBUS_SESSION_BUS_ADDRESS/DISPLAY/WAYLAND_DISPLAY all unset) \
+                 - denying {:?} by default; use `att allow --always <path>` to pre-approve \
+                 binaries where there's no dialog to show",
+                identity.path
+            );
+            return PromptResponse::Deny;
+        }
+
+        let timeout_secs = prompt_timeout_secs();
         let text = dialog_text(identity, target);
         // zenity only reports a distinct exit status for its two built-in
         // buttons (0 = ok, 1 = cancel), so the extra "Always Allow" button
         // is told apart by capturing stdout: pressing it prints its own
         // label there (still with exit status 1, same as Cancel).
+        // `--timeout` makes zenity exit 5 if left unanswered.
         let output = std::process::Command::new("zenity")
             .arg("--question")
             .arg("--title=Attache Access Request")
@@ -188,6 +233,7 @@ impl Prompter for ZenityPrompter {
             .arg("--ok-label=Allow Once")
             .arg("--cancel-label=Deny")
             .arg("--extra-button=Always Allow")
+            .arg(format!("--timeout={timeout_secs}"))
             .output();
 
         match output {
@@ -195,14 +241,19 @@ impl Prompter for ZenityPrompter {
             Ok(output) if String::from_utf8_lossy(&output.stdout).trim() == "Always Allow" => {
                 PromptResponse::AllowAlways
             }
+            Ok(output) if output.status.code() == Some(5) => {
+                // zenity's timeout exit status: the dialog was shown but
+                // nobody answered in time. Logged distinctly from an
+                // explicit Deny so `att denied` readers can tell "ignored"
+                // from "refused".
+                log::warn!(
+                    "access prompt for {:?} went unanswered for {timeout_secs}s - denying",
+                    identity.path
+                );
+                PromptResponse::Deny
+            }
             Ok(_) => PromptResponse::Deny, // explicit Cancel/Deny click
             Err(e) => {
-                // zenity itself couldn't even run (missing, no DISPLAY, ...)
-                // - distinct from a user's explicit Deny click, and the
-                // one case `att allow --always <path>` exists to work
-                // around: in a CLI-only environment, this fires for every
-                // not-yet-whitelisted binary, since there's no dialog to
-                // show at all.
                 log::warn!(
                     "zenity unavailable ({e}) - denying by default; \
                      use `att allow --always <path>` to pre-approve binaries \
@@ -503,6 +554,32 @@ mod tests {
         // let the blocked thread finish cleanly
         release_tx.send(PromptResponse::Deny).unwrap();
         assert_eq!(handle.join().unwrap(), Decision::Deny);
+    }
+
+    #[test]
+    fn gui_env_unavailable_when_display_and_bus_all_unset() {
+        let env: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        assert!(!gui_env_available(|k| env.get(k).map(|s| s.to_string())));
+    }
+
+    #[test]
+    fn gui_env_unavailable_when_vars_present_but_empty() {
+        let env: std::collections::HashMap<&str, &str> =
+            [("DISPLAY", ""), ("WAYLAND_DISPLAY", ""), ("DBUS_SESSION_BUS_ADDRESS", "")]
+                .into_iter()
+                .collect();
+        assert!(!gui_env_available(|k| env.get(k).map(|s| s.to_string())));
+    }
+
+    #[test]
+    fn gui_env_available_with_any_one_of_display_wayland_or_bus() {
+        for key in ["DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"] {
+            let env: std::collections::HashMap<&str, &str> = [(key, "something")].into_iter().collect();
+            assert!(
+                gui_env_available(|k| env.get(k).map(|s| s.to_string())),
+                "expected available when {key} is set"
+            );
+        }
     }
 
     #[test]

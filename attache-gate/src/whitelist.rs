@@ -50,14 +50,29 @@ impl Whitelist {
         Self { file, entries }
     }
 
+    /// The hex SHA-256 recorded when the binary at `path` was approved, or
+    /// `None` if that path was never approved. Cheap: it only reads the
+    /// in-memory entry list, no hashing. Callers that hold this behind a
+    /// lock should take the string and release the lock *before* hashing
+    /// the (potentially large) binary to compare - see
+    /// `AuthPolicy::decide`.
+    pub fn expected_sha256(&self, path: &Path) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.sha256.clone())
+    }
+
     /// True if `identity`'s binary was previously approved *and* its
     /// current on-disk contents still match the hash recorded at approval
-    /// time.
+    /// time. Hashes the binary, so don't call it with a hot lock held;
+    /// [`expected_sha256`](Self::expected_sha256) + [`hash_file`] is the
+    /// split-lock form.
     pub fn is_allowed(&self, identity: &ProcessIdentity) -> bool {
-        let Some(entry) = self.entries.iter().find(|e| e.path == identity.path) else {
+        let Some(expected) = self.expected_sha256(&identity.path) else {
             return false;
         };
-        matches!(hash_file(&identity.path), Ok(hash) if hash == entry.sha256)
+        matches!(hash_file(&identity.path), Ok(hash) if hash == expected)
     }
 
     /// Records `identity` as always-allowed and persists the whitelist to
@@ -100,7 +115,9 @@ impl Whitelist {
     }
 }
 
-fn hash_file(path: &Path) -> io::Result<String> {
+/// Hex-encoded SHA-256 of the file at `path`. Reads the whole file, so
+/// keep it off any hot lock path.
+pub(crate) fn hash_file(path: &Path) -> io::Result<String> {
     let bytes = fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);

@@ -315,6 +315,20 @@ open_attache() {
     rm -f "$PWFIFO"
     mkfifo -m 600 "$PWFIFO"
 
+    # attache-gate shows the allow/deny prompt with zenity, which needs the
+    # graphical session's environment. setsid keeps whatever this shell
+    # already has; these are the vars that actually matter, named here so
+    # the dependency is in one obvious place. If none of the display vars
+    # are set, live prompts can't work at all - warn now rather than let
+    # every first access silently deny later (pre-approve with
+    # `att allow --always <binary>` in that case).
+    export DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS XAUTHORITY
+    if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+        echo "att: warning: no graphical session detected (DISPLAY/WAYLAND_DISPLAY unset)." >&2
+        echo "       Live GUI access prompts won't appear; unapproved apps will be denied." >&2
+        echo "       Pre-approve them with: att allow --always <path-to-binary>" >&2
+    fi
+
     setsid "$SELF" __manager >>"$LOGFILE" 2>&1 &
     echo $! >"$MANAGER_PIDFILE"
 
@@ -808,7 +822,8 @@ Access control: the first time an app not already approved tries to open
 a file in Attache, a GUI dialog asks Allow Once / Always Allow / Deny.
 Where there's no GUI to show that (e.g. over SSH, or a headless machine),
 unapproved access is denied by default instead - see `att allow` and
-`att denied` for the CLI-only equivalent.
+`att denied` for the CLI-only equivalent. A dialog left unanswered for
+ATTACHE_PROMPT_TIMEOUT seconds (default 120) auto-denies that one access.
 
 Mountpoint: Attache is always visible at ~/attache by default. Set
 MOUNTPOINT="$HOME/whatever-you-like" in ~/.config/attache/config to use a

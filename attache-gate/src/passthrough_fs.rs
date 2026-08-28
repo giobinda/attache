@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use filetime::FileTime;
@@ -38,7 +38,11 @@ fn is_protected(path: &std::path::Path) -> bool {
 /// an [`AuthPolicy`] decision keyed on the calling process's binary.
 pub struct PassthroughFs<P: Prompter, R: ProcessResolver> {
     inodes: Mutex<InodeTable>,
-    handles: Mutex<HashMap<u64, File>>,
+    // `Arc<File>` (not `File`) so `read`/`write` can clone the handle out
+    // under the lock and then do the backing I/O with the lock released -
+    // otherwise every read/write in the vault serialises through this one
+    // mutex for the whole duration of a gocryptfs-backed transfer.
+    handles: Mutex<HashMap<u64, Arc<File>>>,
     next_fh: AtomicU64,
     auth: AuthPolicy<P>,
     resolver: R,
@@ -332,7 +336,7 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
         match opts.open(&path) {
             Ok(file) => {
                 let fh = self.alloc_fh();
-                self.handles.lock().unwrap().insert(fh, file);
+                self.handles.lock().unwrap().insert(fh, Arc::new(file));
                 reply.opened(FileHandle(fh), FopenFlags::empty());
             }
             Err(e) => reply.error(e.into()),
@@ -371,7 +375,7 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
                     let ino = self.inodes.lock().unwrap().ino_for(target);
                     let attr = attr_from_metadata(ino, &meta);
                     let fh = self.alloc_fh();
-                    self.handles.lock().unwrap().insert(fh, file);
+                    self.handles.lock().unwrap().insert(fh, Arc::new(file));
                     reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
                 }
                 Err(e) => reply.error(e.into()),
@@ -391,10 +395,15 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let handles = self.handles.lock().unwrap();
-        let Some(file) = handles.get(&fh.0) else {
-            reply.error(Errno::EBADF);
-            return;
+        let file = {
+            let handles = self.handles.lock().unwrap();
+            match handles.get(&fh.0) {
+                Some(f) => Arc::clone(f),
+                None => {
+                    reply.error(Errno::EBADF);
+                    return;
+                }
+            }
         };
         let mut buf = vec![0u8; size as usize];
         match file.read_at(&mut buf, offset) {
@@ -418,10 +427,15 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let handles = self.handles.lock().unwrap();
-        let Some(file) = handles.get(&fh.0) else {
-            reply.error(Errno::EBADF);
-            return;
+        let file = {
+            let handles = self.handles.lock().unwrap();
+            match handles.get(&fh.0) {
+                Some(f) => Arc::clone(f),
+                None => {
+                    reply.error(Errno::EBADF);
+                    return;
+                }
+            }
         };
         match file.write_at(data, offset) {
             Ok(n) => reply.written(n as u32),

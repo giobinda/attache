@@ -59,6 +59,24 @@ fn main() -> ExitCode {
         .mount_options
         .push(MountOption::FSName("attache-gate".to_string()));
 
+    // Dispatch FUSE requests across several worker threads rather than the
+    // single one `fuser` defaults to. An access prompt (see policy.rs)
+    // blocks the thread that serves the gated `open`/`create`/`setattr`
+    // until a human answers the dialog; with one dispatch thread that
+    // freezes the *entire* mount - including un-gated `readdir`/`getattr`,
+    // so a file manager listing the vault hangs behind an unrelated
+    // prompt. With N threads a pending prompt only ties up one of them.
+    // The kernel still enforces per-inode/per-fh ordering, so this doesn't
+    // reorder dependent operations.
+    let n_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .clamp(4, 16);
+    config.n_threads = Some(n_threads);
+    // Give each worker its own /dev/fuse fd (Linux 4.5+); avoids all
+    // workers contending on one fd's read lock.
+    config.clone_fd = true;
+
     if let Err(e) = fuser::mount(fs, &mountpoint, &config) {
         eprintln!("error: failed to mount: {e}");
         return ExitCode::FAILURE;
