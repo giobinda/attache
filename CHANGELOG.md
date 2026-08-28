@@ -1,0 +1,27 @@
+# Changelog
+
+All notable changes are recorded here. Every bug fix ships as a new release.
+
+## v0.1.1
+
+### Fixed
+- **Critical:** the whole vault froze on the first file access from any app
+  (FreeCAD, a preview/thumbnail worker, an indexer): the FUSE session ran on a
+  single dispatch thread, so a gated `open`/`create`/`setattr` blocked in the
+  access prompt stalled every other request — including un-gated
+  `readdir`/`getattr`. If `zenity` couldn't reach the session bus it hung
+  there permanently with no dialog shown.
+  - FUSE dispatch is now multi-threaded (`n_threads` = CPUs, clamped 4–16).
+  - `zenity` fails closed immediately when there's no display / session bus,
+    instead of hanging in GTK's D-Bus autolaunch.
+  - Access prompts auto-deny after `ATTACHE_PROMPT_TIMEOUT` seconds
+    (default 120) so an unanswered dialog can't pin a worker.
+  - `read`/`write` no longer hold the open-handle lock across backing I/O;
+    the whitelist lock is released before hashing the calling binary.
+- `att open` now warns when no graphical session is detected.
+
+## v0.1.0
+
+- Initial public release: `attache-gate` (per-binary FUSE access gate),
+  `attache-mount-helper` (privileged mount-namespace setup), `attache-import`
+  (verified restore from an exported disc), and the `att` CLI.
