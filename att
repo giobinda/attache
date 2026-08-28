@@ -1,0 +1,837 @@
+#!/usr/bin/env bash
+# Mount/unmount the gocryptfs-encrypted $HOME/.attache volume, exposed by
+# default at $HOME/attache through attache-gate: a FUSE passthrough layer
+# that prompts (via a GUI dialog) before letting any process open a file
+# in the vault, and caches the allow/deny decision per binary for the
+# session.
+#
+# Layering: gocryptfs mounts the real decrypted content into a backing
+# dir; attache-gate mounts $HOME/.attache-mnt on top of that backing dir
+# and gates access to it - always this exact hardcoded, hidden path,
+# never configurable (see attache-mount-helper's doc comment for why).
+# $MOUNTPOINT (default $HOME/attache, override via
+# ~/.config/attache/config) is just an ordinary symlink onto it, so the
+# display name can be anything you like without touching anything
+# privileged. Critically, the backing dir lives inside a private mount
+# namespace that only attache-mount-helper/gocryptfs/attache-gate ever join -
+# without that, any process running as this user could just read the
+# backing dir directly and skip attache-gate's gating entirely, since a
+# plain directory's permission bits can't tell "attache-gate" apart from
+# "any other program this user runs". `$HOME/.attache-mnt` itself is still
+# visible everywhere apps expect it (through the $MOUNTPOINT symlink), via
+# a `shared`-propagation mountpoint set up once by `attache-mount-helper
+# setup` (see that binary's doc comment for the mechanism). `open`
+# collects the gocryptfs password on a real terminal, then hands off to a
+# single background manager process,
+# which owns both mounts for as long as the vault is open and tears them
+# down when any of the following happen:
+#   - `att close` asks it to (SIGTERM)
+#   - the machine is shutting down: PID 1 sends SIGTERM to every
+#     remaining process during shutdown, manager included, no extra
+#     wiring needed
+#   - the login session ends (logout) - watched for via logind's
+#     SessionRemoved D-Bus signal, since a detached background process
+#     otherwise gets no signal at logout on this machine
+#     (KillUserProcesses=no)
+#   - the machine is about to suspend/hibernate - watched for via
+#     logind's PrepareForSleep D-Bus signal, since suspend delivers no
+#     process signal at all
+#   - nobody has touched the vault in a while (idle timeout)
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+# CIPHERDIR and REAL_MOUNTPOINT are deliberately not configurable, here or
+# anywhere downstream (attache-mount-helper hardcodes the exact same two
+# paths) - see that binary's doc comment for why: the CAP_SYS_ADMIN
+# operations in `setup` must never be pointed somewhere caller-controlled.
+# What *is* configurable is MOUNTPOINT below, the display name a plain,
+# unprivileged symlink gets pointed at REAL_MOUNTPOINT - tampering with
+# that symlink can only break the friendly name, never bypass the gate,
+# since the real mount is always exactly here regardless.
+CIPHERDIR="$HOME/.attache"
+REAL_MOUNTPOINT="$HOME/.attache-mnt"
+STATE_DIR="$HOME/.local/state/attache"
+BACKING="$STATE_DIR/decrypted"
+MANAGER_PIDFILE="$STATE_DIR/manager.pid"
+LOGFILE="$STATE_DIR/manager.log"
+GATE_LOGFILE="$STATE_DIR/gate.log"
+STAMPFILE="$STATE_DIR/last_active"
+PWFIFO="$STATE_DIR/open.pwfifo"
+CONTROL_SOCKET="$STATE_DIR/control.sock"  # kept in sync with SOCKET_NAME in attache-gate/src/control.rs
+CHECK_INTERVAL_MIN=5   # how often to check, and the inactivity window
+
+# Only setting here is MOUNTPOINT, the display name symlinked to
+# REAL_MOUNTPOINT (see the comment above) - e.g. MOUNTPOINT="$HOME/notes".
+# Safe to be a plain sourced file precisely because nothing it can set
+# ever reaches a privileged operation.
+CONFIG_FILE="$HOME/.config/attache/config"
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+: "${MOUNTPOINT:=$HOME/attache}"
+
+# Binaries bundled onto an exported disc so a fresh machine needs nothing
+# preinstalled to restore the vault. Resolved from PATH at export time
+# rather than hardcoded to any one machine's layout - on a normally
+# installed Attache these already are the static musl builds that
+# `attache-import` itself installs into ~/.local/bin.
+resolve_bin() {
+    local name="$1" path
+    if ! path="$(command -v "$name" 2>/dev/null)"; then
+        echo "att: missing required binary on PATH: $name" >&2
+        echo "       build/install it first (run install.sh at the repo root)" >&2
+        exit 1
+    fi
+    printf '%s\n' "$path"
+}
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+# $REAL_MOUNTPOINT is permanently bind-mounted onto itself once
+# `attache-mount-helper setup` has ever run (that's what makes it a
+# `shared`-propagation mountpoint - see that binary's doc comment), so
+# plain `mountpoint -q` would report true even when the vault is closed.
+# Check specifically for attache-gate's own FUSE mount on top of that
+# self-bind instead. Checks REAL_MOUNTPOINT, not the (possibly symlinked,
+# possibly renamed) display name $MOUNTPOINT - that's what actually shows
+# up in the mount table regardless of what any symlink is called.
+is_mounted() {
+    # Neither a plain `findmnt PATH` nor `findmnt -T PATH` collapses to a
+    # single row once more than one mount is stacked at the same target
+    # (confirmed empirically - both list every stacked entry), which
+    # silently breaks a single-line string comparison. Parse
+    # /proc/self/mountinfo directly instead: entries are appended in
+    # mount order, so the *last* line whose target (field 5) matches is
+    # the topmost, currently-effective one; its source is two fields past
+    # the "-" separator that marks the end of the variable-length
+    # optional-fields section.
+    local line source
+    line="$(awk -v t="$REAL_MOUNTPOINT" '$5==t' /proc/self/mountinfo | tail -n1)"
+    [[ -z "$line" ]] && return 1
+    source="$(awk '{for(i=1;i<=NF;i++) if($i=="-"){print $(i+2); exit}}' <<<"$line")"
+    [[ "$source" == "attache-gate" ]]
+}
+
+manager_running() {
+    [[ -f "$MANAGER_PIDFILE" ]] && kill -0 "$(cat "$MANAGER_PIDFILE")" 2>/dev/null
+}
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOGFILE"
+}
+
+# Activity = any file under the mount modified since the last check, or
+# any file under the mount currently held open by a process (editor, etc).
+has_activity() {
+    if find "$REAL_MOUNTPOINT" -newer "$STAMPFILE" -print -quit 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    if lsof +D "$REAL_MOUNTPOINT" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# Watches logind for events the manager can't otherwise learn about, and
+# nudges it (SIGUSR1) to close. Uses a plain D-Bus signal subscription
+# (what any desktop power manager does), not the bus-eavesdrop mode that
+# `busctl monitor`/`dbus-monitor` need root or polkit for.
+#
+# gdbus and the reader are connected through a FIFO rather than a `|`
+# pipeline, so each gets its own unambiguous PID via $!: in `cmd1 | cmd2 &`
+# only cmd2's PID is exposed, leaving cmd1 (gdbus monitor) an unkillable
+# orphan once the reader exits. (A coproc has the same problem in reverse -
+# its fd doesn't survive being read from a further backgrounded subshell,
+# which bash closes coprocess fds in by design.)
+start_event_watch() {
+    local fifo="$STATE_DIR/event.fifo"
+    rm -f "$fifo"
+    mkfifo "$fifo"
+    gdbus monitor -y -d org.freedesktop.login1 -o /org/freedesktop/login1 >"$fifo" 2>/dev/null &
+    GDBUS_PID=$!
+    (
+        while IFS= read -r line; do
+            case "$line" in
+                *"PrepareForSleep (true"*)
+                    log "suspend/hibernate imminent, signaling manager"
+                    kill -USR1 "$$" 2>/dev/null || true
+                    break
+                    ;;
+                *"SessionRemoved ('${XDG_SESSION_ID:-}',"*)
+                    [[ -n "${XDG_SESSION_ID:-}" ]] || continue
+                    log "login session ended, signaling manager"
+                    kill -USR1 "$$" 2>/dev/null || true
+                    break
+                    ;;
+            esac
+        done <"$fifo"
+        rm -f "$fifo"
+    ) &
+    EVENT_WATCH_PID=$!
+}
+
+do_shutdown() {
+    log "closing ($1)"
+    if [[ -n "${GDBUS_PID:-}" ]]; then
+        kill "$GDBUS_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${EVENT_WATCH_PID:-}" ]]; then
+        kill "$EVENT_WATCH_PID" 2>/dev/null || true
+    fi
+    rm -f "$STATE_DIR/event.fifo"
+
+    # Unmount before touching attache-gate: killing it while the kernel still
+    # considers $REAL_MOUNTPOINT attached leaves the mountpoint stuck in
+    # "Transport endpoint not connected" until someone runs `fusermount -u`
+    # by hand - nothing else clears that half-torn-down state. `fusermount
+    # -u` can fail transiently (e.g. EBUSY, a handle not yet released), so
+    # retry briefly before falling back to a lazy unmount, which detaches
+    # the mountpoint from the namespace immediately regardless - the kernel
+    # finishes the underlying teardown once attache-gate exits below.
+    if is_mounted; then
+        for _ in $(seq 1 20); do
+            fusermount -u "$REAL_MOUNTPOINT" 2>/dev/null && break
+            sleep 0.1
+        done
+        if is_mounted; then
+            log "normal unmount of $REAL_MOUNTPOINT did not take, forcing a lazy unmount"
+            fusermount -uz "$REAL_MOUNTPOINT" 2>/dev/null || true
+        fi
+    fi
+    # attache-gate unmounts $BACKING itself once its own FUSE loop ends (see
+    # main.rs) - which the fusermount -u above should have just triggered
+    # normally, so this wait is really just giving it a moment to finish
+    # that before we fall back to a harder kill. If we do end up on the
+    # kill branch, $BACKING is orphaned (still mounted, invisible outside
+    # this namespace, harmless but not reclaimed) until whatever's left
+    # running inside that private namespace eventually exits - a resource
+    # leak, not a security issue, and not worth a second privileged helper
+    # call just to chase down this corner case.
+    if [[ -n "${GATE_PID:-}" ]]; then
+        for _ in $(seq 1 20); do
+            kill -0 "$GATE_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill "$GATE_PID" 2>/dev/null || true
+    fi
+    rmdir "$REAL_MOUNTPOINT" 2>/dev/null || true
+    rm -f "$MANAGER_PIDFILE" "$PWFIFO"
+}
+
+# The single background process `open` starts and `close` stops. Runs
+# detached (setsid) so it survives the shell that launched it; everything
+# it owns is torn down by do_shutdown, triggered by a trapped signal.
+cmd_manager() {
+    trap 'do_shutdown "signal"; exit 0' TERM HUP
+    trap 'do_shutdown "logind event"; exit 0' USR1
+    log "manager starting (pid $$)"
+
+    # attache-mount-helper does the privileged part (entering a real mount
+    # namespace) and the password-consuming part (reading gocryptfs's
+    # password from $PWFIFO, which open_attache is writing to on a real
+    # terminal right about now) in one step, then execs into attache-gate -
+    # same PID from here on, still inside that namespace, but without the
+    # helper's CAP_SYS_ADMIN (attache-gate has no file capabilities, so exec
+    # drops it the normal way).
+    # attache-mount-helper's own gocryptfs step blocks on $PWFIFO until
+    # open_attache's `read -s -p` in the real terminal returns - i.e. until
+    # a human finishes typing, which can easily take longer than the
+    # handful of seconds the actual mount takes once that happens. This
+    # budget has to cover human password-entry time, not just mount time,
+    # or a slightly slow typist gets attache-gate killed mid-registration,
+    # leaving a "Transport endpoint not connected" stale mount behind (the
+    # process died holding a half-set-up kernel mount table entry, with
+    # nothing left to cleanly unmount it). A wrong password still fails
+    # fast regardless of this budget, via the kill -0 branch below -
+    # gocryptfs's -passfile mode doesn't retry, it just exits.
+    RUST_LOG=info attache-mount-helper run >>"$GATE_LOGFILE" 2>&1 &
+    GATE_PID=$!
+    for _ in $(seq 1 300); do
+        is_mounted && break
+        kill -0 "$GATE_PID" 2>/dev/null || { log "attache-mount-helper/attache-gate exited before mounting"; do_shutdown "gate crashed before mounting"; exit 1; }
+        sleep 0.2
+    done
+    if ! is_mounted; then
+        log "attache-gate failed to mount within 60s"
+        do_shutdown "gate failed to mount"
+        exit 1
+    fi
+    rm -f "$PWFIFO"
+
+    start_event_watch
+    touch "$STAMPFILE"
+
+    while is_mounted && kill -0 "$GATE_PID" 2>/dev/null; do
+        sleep "$((CHECK_INTERVAL_MIN * 60))" &
+        wait $! || true
+        is_mounted || break
+        if has_activity; then
+            touch "$STAMPFILE"
+        else
+            do_shutdown "idle ${CHECK_INTERVAL_MIN}m"
+            exit 0
+        fi
+    done
+    do_shutdown "gate mount gone unexpectedly"
+}
+
+# open_attache/close_attache return rather than exit, so `att note` can drive
+# them directly (auto-open on demand, close again if it did the opening)
+# without tearing down the whole script.
+open_attache() {
+    if manager_running; then
+        echo "att: already open at $MOUNTPOINT"
+        return 0
+    fi
+    mkdir -p "$REAL_MOUNTPOINT"
+    chmod 700 "$REAL_MOUNTPOINT"
+    # gocryptfs mirrors $CIPHERDIR's own on-disk permissions onto whatever
+    # gets mounted on top of it - chmod'ing the mountpoint has no effect
+    # here (nothing to shadow it with yet, and the mount itself would
+    # override it anyway later), so the real ciphertext directory is what
+    # actually needs tightening, and doing it here means it's enforced
+    # every open regardless of how it was originally created (a fresh
+    # `gocryptfs -init` inherits the umask, an imported one whatever the
+    # exporting machine had).
+    [[ -d "$CIPHERDIR" ]] && chmod 700 "$CIPHERDIR"
+
+    # The display name: an ordinary symlink onto REAL_MOUNTPOINT, created
+    # fresh every open (harmless if it already points there). Skipped
+    # entirely if someone points MOUNTPOINT at REAL_MOUNTPOINT itself.
+    if [[ "$MOUNTPOINT" != "$REAL_MOUNTPOINT" ]]; then
+        ln -sfn "$REAL_MOUNTPOINT" "$MOUNTPOINT"
+    fi
+
+    # Idempotent: marks $REAL_MOUNTPOINT `shared` and $STATE_DIR `private`
+    # in this session's real mount namespace, ahead of the manager
+    # creating a real private one below. Needs attache-mount-helper
+    # installed with CAP_SYS_ADMIN (see install-mount-helper.sh) - that's
+    # the one-time privileged step this whole design relies on.
+    if ! attache-mount-helper setup; then
+        echo "att: mount-namespace setup failed - is attache-mount-helper installed and" >&2
+        echo "       granted cap_sys_admin? (see attache-cli/install-mount-helper.sh)" >&2
+        return 1
+    fi
+
+    rm -f "$PWFIFO"
+    mkfifo -m 600 "$PWFIFO"
+
+    setsid "$SELF" __manager >>"$LOGFILE" 2>&1 &
+    echo $! >"$MANAGER_PIDFILE"
+
+    # Password prompt runs here, on this interactive shell's real
+    # terminal - the manager is already backgrounded and can't offer one.
+    # Handed to gocryptfs (inside the manager, via attache-mount-helper)
+    # through $PWFIFO, opened read-write so this write can never block
+    # waiting for a reader: if the manager errors out before ever reading
+    # it, the password just sits in the pipe buffer and gets discarded
+    # with the fifo below, while the poll loop's timeout reports the
+    # failure. Never touches argv or an env var, so it's not visible to
+    # other processes via /proc/<pid>/cmdline or /proc/<pid>/environ.
+    local password
+    if ! read -r -s -p "Attache password: " password; then
+        echo >&2
+        echo "att: no password entered" >&2
+        kill "$(cat "$MANAGER_PIDFILE")" 2>/dev/null || true
+        rm -f "$MANAGER_PIDFILE" "$PWFIFO"
+        return 1
+    fi
+    echo
+    exec 9<>"$PWFIFO"
+    printf '%s\n' "$password" >&9
+    exec 9>&-
+    unset password
+
+    # The password is already sent by this point, so this is only waiting
+    # on the actual mount (normally well under a second) - generous
+    # headroom mainly to avoid racing cmd_manager's own (much longer,
+    # human-typing-inclusive) budget into reporting "failed" prematurely.
+    for _ in $(seq 1 100); do
+        if is_mounted; then
+            echo "att: open at $MOUNTPOINT (auto-closes after ${CHECK_INTERVAL_MIN}m idle, at logout/shutdown, or before suspend; access prompts via GUI dialog)"
+            return 0
+        fi
+        manager_running || break
+        sleep 0.1
+    done
+    echo "att: failed to open, see $LOGFILE and $GATE_LOGFILE" >&2
+    rm -f "$MANAGER_PIDFILE" "$PWFIFO"
+    return 1
+}
+
+close_attache() {
+    if ! manager_running; then
+        echo "att: not open"
+        # in case a previous manager died without cleaning up
+        if is_mounted; then
+            do_shutdown "manual cleanup"
+        fi
+        rmdir "$REAL_MOUNTPOINT" 2>/dev/null || true
+        return 0
+    fi
+    kill -TERM "$(cat "$MANAGER_PIDFILE")"
+    for _ in $(seq 1 50); do
+        manager_running || { echo "att: closed"; return 0; }
+        sleep 0.1
+    done
+    echo "att: manager did not exit in time, forcing cleanup" >&2
+    kill -KILL "$(cat "$MANAGER_PIDFILE")" 2>/dev/null || true
+    rm -f "$MANAGER_PIDFILE"
+    do_shutdown "forced after manager hang"
+}
+
+# Creates a brand-new, empty vault at $CIPHERDIR. There's no privileged or
+# mounting step involved in creating an empty vault (only in opening one),
+# so this runs entirely unprivileged and delegates the password prompt
+# straight to gocryptfs's own -init (reads from the terminal directly,
+# asks for confirmation, never touches argv or an env var).
+cmd_init() {
+    if [[ -e "$CIPHERDIR" ]] && [[ -n "$(ls -A "$CIPHERDIR" 2>/dev/null)" ]]; then
+        echo "att: $CIPHERDIR already exists and is not empty - nothing to do." >&2
+        echo "       Already have a vault? Just run 'att open'." >&2
+        exit 1
+    fi
+    local gocryptfs_bin
+    gocryptfs_bin="$(resolve_bin gocryptfs)"
+    mkdir -p "$CIPHERDIR"
+    chmod 700 "$CIPHERDIR"
+    if ! "$gocryptfs_bin" -init "$CIPHERDIR"; then
+        echo "att: vault creation failed" >&2
+        exit 1
+    fi
+    echo
+    echo "att: vault created at $CIPHERDIR - run 'att open' to mount it."
+}
+
+cmd_open()  { open_attache; }
+cmd_close() { close_attache; }
+
+# Opens $EDITOR/$VISUAL (default vim) on a note inside the vault. Runs the
+# editor with HOME/XDG_* pointed at a throwaway tmpfs dir instead of the
+# real $HOME, so viminfo/shada, search-history files, GUI editors' "recently
+# used" lists, and anything else an editor writes outside the file itself
+# land there and get discarded on exit - the note's content and even its
+# filename stay inside the vault, whichever editor is configured. Swap/
+# backup files an editor places next to the note (vim's default) are fine
+# as-is, since "next to the note" means inside the vault.
+#
+# Caveat: if the system is swapping under memory pressure, tmpfs pages can
+# still end up on disk - this isn't a guarantee against that.
+cmd_note() {
+    local filename="${1:-}"
+    if [[ -z "$filename" ]]; then
+        filename="$(date +%Y%m%d-%H%M%S).vnote"
+    fi
+    case "$filename" in
+        /*|*..*)
+            echo "att: filename must be relative, without '..'" >&2
+            exit 1
+            ;;
+    esac
+
+    local we_opened_it=0
+    if ! is_mounted; then
+        open_attache || exit 1
+        we_opened_it=1
+    fi
+
+    local sandbox_base="/dev/shm"
+    [[ -w "$sandbox_base" ]] || sandbox_base="${TMPDIR:-/tmp}"
+    local sandbox
+    sandbox="$(mktemp -d "$sandbox_base/attache-note.XXXXXX")"
+
+    # `|| true`: a nonzero exit from the editor (e.g. vim's :cq) must not
+    # skip sandbox cleanup or the close-again-if-we-opened-it step below.
+    HOME="$sandbox" \
+    XDG_CONFIG_HOME="$sandbox/.config" \
+    XDG_DATA_HOME="$sandbox/.local/share" \
+    XDG_STATE_HOME="$sandbox/.local/state" \
+    XDG_CACHE_HOME="$sandbox/.cache" \
+        "${VISUAL:-${EDITOR:-vim}}" "$MOUNTPOINT/$filename" || true
+
+    rm -rf "$sandbox"
+
+    if [[ "$we_opened_it" == 1 ]]; then
+        close_attache
+    fi
+}
+
+cmd_status() {
+    if is_mounted; then
+        echo "att: open at $MOUNTPOINT"
+        if manager_running; then
+            echo "manager: running (checks every ${CHECK_INTERVAL_MIN}m; watching for shutdown/logout/suspend)"
+        else
+            echo "manager: not running (mount is orphaned - run 'att close' to clean up)"
+        fi
+    else
+        echo "att: closed"
+    fi
+}
+
+cmd_export() {
+    local outdir="${1:?Usage: att export <output-dir>}"
+
+    # is_mounted alone is sufficient now: gocryptfs's backing mount only
+    # ever exists as part of the same manager/namespace lifecycle that
+    # also mounts attache-gate, so the two are always up or down together.
+    if is_mounted; then
+        echo "att: run 'att close' first, so the export is a consistent snapshot" >&2
+        exit 1
+    fi
+
+    local gocryptfs_bin attache_gate_bin attache_mount_helper_bin attache_import_bin
+    gocryptfs_bin="$(resolve_bin gocryptfs)"
+    attache_gate_bin="$(resolve_bin attache-gate)"
+    attache_mount_helper_bin="$(resolve_bin attache-mount-helper)"
+    attache_import_bin="$(resolve_bin attache-import)"
+
+    mkdir -p "$outdir"
+    local stage
+    stage="$(mktemp -d)"
+    # NB: the trap fires in the top-level script scope, after this function
+    # has already returned and its `local stage` has gone out of scope, so
+    # the path must be baked into the trap command now (double quotes),
+    # not looked up from $stage later (which `set -u` would reject as unset).
+    trap "rm -rf '$stage'" EXIT
+
+    mkdir -p "$stage/attache" "$stage/bin"
+    cp -a "$CIPHERDIR/." "$stage/attache/"
+
+    cp "$gocryptfs_bin" "$stage/bin/gocryptfs"
+    cp "$attache_gate_bin" "$stage/bin/attache-gate"
+    cp "$attache_mount_helper_bin" "$stage/bin/attache-mount-helper"
+    cp "$attache_import_bin" "$stage/bin/attache-import"
+    cp "$SELF" "$stage/bin/att"
+    cp "$(dirname "$SELF")/install-mount-helper.sh" "$stage/bin/install-mount-helper.sh"
+    chmod 755 "$stage/bin/"*
+
+    (cd "$stage/attache" && find . -type f -exec sha256sum {} +) >"$stage/MANIFEST.sha256"
+
+    cat >"$stage/README.txt" <<'EOF'
+This disc contains an Attache-encrypted vault (gocryptfs) plus everything
+needed to restore it on a fresh Linux machine (any distro, x86_64) with
+nothing preinstalled beyond a kernel with FUSE support.
+
+To restore, from a terminal with this disc mounted:
+
+    ./bin/attache-import <path-to-this-mounted-disc>
+
+That verifies every vault file against MANIFEST.sha256, then installs:
+  - the encrypted vault into ~/.attache
+  - gocryptfs, attache-gate, attache-mount-helper, and the att script into
+    ~/.local/bin
+
+Then, once (needs sudo - see that script's own comments for why):
+    sudo ~/.local/bin/install-mount-helper.sh
+
+Then run:
+    att open
+
+(Make sure ~/.local/bin is on your PATH.)
+
+Skipping the install-mount-helper.sh step means `att open` will refuse
+to start: it's what lets the vault's decrypted contents stay invisible to
+every other process on the machine instead of just gated at $HOME/attache
+while also sitting fully readable at $HOME/.local/state/attache/decrypted.
+
+Manual fallback (if you don't want to run attache-import): copy the
+attache/ directory to ~/.attache yourself, copy bin/gocryptfs, bin/attache-gate,
+bin/attache-mount-helper, bin/att, and bin/install-mount-helper.sh to
+~/.local/bin and chmod +x them, then follow the two steps above.
+You can verify integrity manually first with:
+    cd attache && sha256sum -c ../MANIFEST.sha256
+EOF
+
+    local iso="$outdir/attache-backup-$(date +%Y%m%d-%H%M%S).iso"
+    xorriso -as mkisofs -r -J -V ATTACHE_BACKUP -o "$iso" "$stage"
+
+    echo "att: wrote $iso"
+    echo "att: burn it, e.g.:"
+    echo "  growisofs -Z /dev/sr0=$iso     # DVD/BD, one pass"
+    echo "  wodim -v dev=/dev/sr0 $iso     # alternative"
+}
+
+# Permanently destroys the vault. Two-step: first overwrite the gocryptfs
+# key/IV files with random data (so even recovered ciphertext should be
+# undecryptable), then delete the encrypted payload outright. No flag
+# skips the two "yes" confirmations - this is irreversible.
+cmd_oblivion() {
+    if is_mounted; then
+        echo "att: run 'att close' first" >&2
+        exit 1
+    fi
+    if [[ ! -d "$CIPHERDIR" ]]; then
+        echo "att: nothing to destroy, $CIPHERDIR does not exist"
+        exit 0
+    fi
+
+    echo "This will PERMANENTLY destroy the vault at $CIPHERDIR."
+    echo "There is no undo, and no backup unless you made one yourself (e.g. 'att export')."
+    # `read` alone, unguarded, fails (and under `set -e` silently kills the
+    # whole script with no message at all) on EOF/no-input rather than
+    # returning an empty answer - guard it explicitly so "aborted" is what
+    # the user actually sees instead of the command just vanishing.
+    confirm1=""
+    read -r -p "Type yes to continue: " confirm1 || true
+    [[ "$confirm1" == "yes" ]] || { echo "att: aborted, nothing was touched"; exit 1; }
+
+    confirm2=""
+    read -r -p "Really destroy it? Type yes again: " confirm2 || true
+    [[ "$confirm2" == "yes" ]] || { echo "att: aborted, nothing was touched"; exit 1; }
+
+    echo "att: overwriting key material with random data..."
+    find "$CIPHERDIR" \( -name gocryptfs.conf -o -name gocryptfs.diriv \) -type f -print0 |
+        xargs -0 -r shred -n 3 -u -v
+
+    # gate.log/manager.log record real attache file paths (FUSE trace output,
+    # access-prompt targets, ...) in plain text outside the encrypted
+    # payload - "no recoverable trace" has to mean these too, not just the
+    # ciphertext, or oblivion leaves exactly the kind of record it exists
+    # to destroy.
+    echo "att: shredding logs..."
+    find "$STATE_DIR" -maxdepth 1 -name '*.log' -type f -print0 |
+        xargs -0 -r shred -n 3 -u -v
+
+    echo "att: deleting encrypted payload..."
+    rm -rf "$CIPHERDIR"
+    rm -rf "$STATE_DIR" "$REAL_MOUNTPOINT" 2>/dev/null || true
+    # $MOUNTPOINT is just a symlink onto REAL_MOUNTPOINT (unless someone
+    # pointed it at REAL_MOUNTPOINT itself, already removed above) - `rm
+    # -f`, not `-rf`, since it must never follow the link and touch
+    # whatever it points at.
+    [[ "$MOUNTPOINT" != "$REAL_MOUNTPOINT" ]] && rm -f "$MOUNTPOINT" 2>/dev/null || true
+
+    echo "att: oblivion complete, $CIPHERDIR no longer exists."
+}
+
+# Runs `attache-mount-helper <args...>` with the vault closed, feeding it
+# the gocryptfs password through $PWFIFO exactly like open_attache does, but
+# never mounting $REAL_MOUNTPOINT - for one-off maintenance operations
+# (reset-whitelist, allow-always) that only need the isolated backing dir
+# for a moment, not a live FUSE mount. Prints its own error messages;
+# returns the helper's exit status.
+run_helper_with_password() {
+    if is_mounted; then
+        echo "att: run 'att close' first" >&2
+        return 1
+    fi
+    if [[ ! -d "$CIPHERDIR" ]]; then
+        echo "att: nothing to do, $CIPHERDIR does not exist" >&2
+        return 1
+    fi
+    if ! attache-mount-helper setup; then
+        echo "att: mount-namespace setup failed - is attache-mount-helper installed and" >&2
+        echo "       granted cap_sys_admin? (see attache-cli/install-mount-helper.sh)" >&2
+        return 1
+    fi
+
+    rm -f "$PWFIFO"
+    mkfifo -m 600 "$PWFIFO"
+
+    RUST_LOG=info attache-mount-helper "$@" &
+    local helper_pid=$!
+
+    local password
+    if ! read -r -s -p "Attache password: " password; then
+        echo >&2
+        echo "att: no password entered" >&2
+        kill "$helper_pid" 2>/dev/null || true
+        rm -f "$PWFIFO"
+        return 1
+    fi
+    echo
+    exec 9<>"$PWFIFO"
+    printf '%s\n' "$password" >&9
+    exec 9>&-
+    unset password
+
+    wait "$helper_pid"
+    local status=$?
+    rm -f "$PWFIFO"
+    return $status
+}
+
+# Sends one line to the running attache-gate's control socket and prints its
+# one-line response; returns 0 only if that response started with "OK".
+# attache-gate is what actually confirms the request (via the same GUI
+# dialog mechanism as a live file-access prompt, see control.rs) and
+# applies it - this only works while the vault is open, and only makes
+# sense while it's open (closed, there's nothing listening, hence
+# run_helper_with_password's separate bootstrap-mount path below).
+send_control_command() {
+    if ! command -v socat >/dev/null 2>&1; then
+        echo "att: socat is required to reach the running attache while it's open" >&2
+        echo "       (install it, or 'att close' first)" >&2
+        return 1
+    fi
+    if [[ ! -S "$CONTROL_SOCKET" ]]; then
+        echo "att: control socket not found at $CONTROL_SOCKET (is attache-gate running?)" >&2
+        return 1
+    fi
+    echo "att: sent - check for a confirmation dialog..."
+    local response
+    response="$(printf '%s\n' "$1" | socat - "UNIX-CONNECT:$CONTROL_SOCKET" 2>&1)"
+    echo "att: $response"
+    [[ "$response" == OK* ]]
+}
+
+# Removes the vault's persistent whitelist of "always allow" approvals
+# (see attache-gate/src/whitelist.rs) - every app will need to be re-approved
+# on its next access afterward.
+cmd_reset_whitelist() {
+    local skip_confirm=0
+    case "${1:-}" in
+        -y|--yes) skip_confirm=1 ;;
+    esac
+
+    if is_mounted; then
+        # attache-gate shows its own confirmation dialog for this over the
+        # control socket, so skip_confirm only applies to the closed-attache
+        # path below, which has no GUI to fall back on if declined there.
+        send_control_command "RESET-WHITELIST"
+        exit $?
+    fi
+
+    if [[ "$skip_confirm" != 1 ]]; then
+        confirm=""
+        read -r -p "Reset the app whitelist? Every app will need to be re-approved. [y/N] " confirm || true
+        [[ "$confirm" == "y" || "$confirm" == "Y" ]] || { echo "att: aborted"; exit 1; }
+    fi
+
+    if run_helper_with_password reset-whitelist; then
+        echo "att: whitelist reset"
+    else
+        echo "att: whitelist reset failed" >&2
+        exit 1
+    fi
+}
+
+# Pre-approves a binary for "always allow" without needing a live prompt -
+# the same persistent whitelist entry "Always Allow" writes in the GUI
+# dialog, just added proactively. Two paths depending on attache state: open,
+# it's sent to the already-running attache-gate over the control socket
+# (which still shows its own confirmation dialog - see control.rs); closed,
+# it bootstraps its own brief mount (see run_helper_with_password). Useful
+# in a CLI-only/headless environment specifically because there's no GUI
+# to show ZenityPrompter's live dialog at all, so anything not pre-approved
+# here is denied by default - see `att denied` for what that's affected.
+cmd_allow() {
+    local always=0 target_path=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --always) always=1; shift ;;
+            -*) echo "att: unknown option: $1" >&2; exit 1 ;;
+            *) target_path="$1"; shift ;;
+        esac
+    done
+    if [[ "$always" != 1 || -z "$target_path" ]]; then
+        echo "att: usage: att allow --always <path-to-binary>" >&2
+        exit 1
+    fi
+    if [[ ! -e "$target_path" ]]; then
+        echo "att: $target_path does not exist" >&2
+        exit 1
+    fi
+
+    if is_mounted; then
+        send_control_command "ALLOW-ALWAYS $target_path"
+        exit $?
+    fi
+
+    if run_helper_with_password allow-always "$target_path"; then
+        echo "att: whitelisted $target_path"
+    else
+        echo "att: failed to whitelist $target_path" >&2
+        exit 1
+    fi
+}
+
+# Shows recent access denials from gate.log (see the ATTACHE-DENIED log line
+# in policy.rs), so an admin knows what to `att allow --always` next -
+# the only feedback loop available in a CLI-only environment, where a
+# denial otherwise has no live prompt to surface it at all.
+cmd_denied() {
+    if [[ ! -f "$GATE_LOGFILE" ]]; then
+        echo "att: no denial history yet"
+        return 0
+    fi
+    local matches
+    matches="$(grep 'ATTACHE-DENIED' "$GATE_LOGFILE" | tail -n 50)"
+    if [[ -z "$matches" ]]; then
+        echo "att: no denials recorded"
+        return 0
+    fi
+    echo "att: recent denials (most recent last) - use 'att allow --always <path>' to pre-approve:"
+    echo "$matches"
+}
+
+# Kept next to the case statement so it's obvious when one drifts out of
+# sync with the other.
+cmd_help() {
+    cat <<'EOF'
+Usage: att <command> [args]
+
+  init                    Create a new vault at ~/.attache (prompts twice
+                          for a password). Run this once, before the
+                          first 'att open'.
+  open                    Mount Attache (prompts for the gocryptfs
+                          password). Auto-closes after 5m idle, at
+                          logout/shutdown, or before suspend.
+  close                   Unmount Attache now.
+  status                  Show whether Attache is open and whether the
+                          background manager is running.
+  note [filename]         Open $EDITOR/$VISUAL on a note inside Attache
+                          (default: a timestamped filename). Auto-opens
+                          Attache if it's closed, and closes it again
+                          afterward if this command was what opened it.
+                          The editor's own state (viminfo, recent-files
+                          lists, ...) never leaves Attache.
+  export <output-dir>     Write a bootable-restore ISO (gocryptfs,
+                          attache-gate, attache-mount-helper, this script, the
+                          encrypted vault, and a manifest) to burn to
+                          DVD/BD. Requires Attache to be closed.
+  oblivion                PERMANENTLY destroy the vault: shred the
+                          gocryptfs key material and this tool's own
+                          logs, then delete the encrypted payload. Two
+                          typed confirmations required. No undo, and no
+                          backup unless you made one yourself.
+  allow --always <path>   Pre-approve a binary for always-allowed Attache
+                          access without waiting for a live prompt. Works
+                          whether Attache is currently open or closed.
+  reset-whitelist [-y]    Remove every "always allow" approval - every
+                          app will need to be re-approved on its next
+                          access. -y skips the confirmation prompt.
+  denied                  Show recent access denials (from gate.log), so
+                          you know what might need `att allow`.
+
+Access control: the first time an app not already approved tries to open
+a file in Attache, a GUI dialog asks Allow Once / Always Allow / Deny.
+Where there's no GUI to show that (e.g. over SSH, or a headless machine),
+unapproved access is denied by default instead - see `att allow` and
+`att denied` for the CLI-only equivalent.
+
+Mountpoint: Attache is always visible at ~/attache by default. Set
+MOUNTPOINT="$HOME/whatever-you-like" in ~/.config/attache/config to use a
+different name - it's just a symlink, safe to rename however you like.
+EOF
+}
+
+case "${1:-}" in
+    init)      cmd_init ;;
+    open)      cmd_open ;;
+    close)     cmd_close ;;
+    status)    cmd_status ;;
+    note)      shift; cmd_note "$@" ;;
+    export)    shift; cmd_export "$@" ;;
+    oblivion)  cmd_oblivion ;;
+    reset-whitelist) shift; cmd_reset_whitelist "$@" ;;
+    allow)     shift; cmd_allow "$@" ;;
+    denied)    cmd_denied ;;
+    help|--help|-h) cmd_help ;;
+    __manager) cmd_manager ;;
+    *)
+        echo "Usage: att {init|open|close|status|note|export|oblivion|allow|reset-whitelist|denied}" >&2
+        echo "Run 'att help' for details." >&2
+        exit 1
+        ;;
+esac
