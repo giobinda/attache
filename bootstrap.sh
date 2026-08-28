@@ -32,6 +32,9 @@ BINS=(attache-gate attache-mount-helper attache-import)
 die()  { echo "bootstrap: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+_tmp=""
+trap '[[ -n "$_tmp" ]] && rm -rf "$_tmp"' EXIT
+
 path_hint() {
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
@@ -64,29 +67,34 @@ install_prebuilt() {
 
     local ref="${ATTACHE_REF:-latest}" tag
     if [[ "$ref" == "latest" ]]; then
-        tag="$(curl -fsSL "https://api.github.com/repos/$SLUG/releases/latest" \
-                 | grep -m1 '"tag_name"' | cut -d'"' -f4)"
-        [[ -n "$tag" ]] || die "could not resolve the latest release of $SLUG (try ATTACHE_REF=v0.1.0)"
+        # Capture the whole response first: piping curl straight into a
+        # short-circuiting filter (grep -m1, head) makes curl die on SIGPIPE,
+        # which `set -o pipefail` would turn into a script abort.
+        local json
+        json="$(curl -fsSL "https://api.github.com/repos/$SLUG/releases/latest")" \
+            || die "could not query the latest release of $SLUG"
+        tag="$(printf '%s\n' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+        [[ -n "$tag" ]] || die "could not parse the latest release tag (pin one with ATTACHE_REF=v0.1.0)"
     else
         tag="$ref"
     fi
 
     local base="https://github.com/$SLUG/releases/download/$tag"
-    local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    _tmp="$(mktemp -d)"
 
     echo "bootstrap: downloading $tag from $SLUG (prebuilt static musl)..."
     local f
     for f in "${BINS[@]}" att install-mount-helper.sh SHA256SUMS; do
-        curl -fsSL "$base/$f" -o "$tmp/$f" \
+        curl -fsSL "$base/$f" -o "$_tmp/$f" \
             || die "could not download $f from release $tag - does that release exist? (try ATTACHE_BUILD=source)"
     done
 
     echo "bootstrap: verifying checksums..."
-    ( cd "$tmp" && sha256sum -c SHA256SUMS ) || die "checksum verification FAILED - aborting"
+    ( cd "$_tmp" && sha256sum -c SHA256SUMS ) || die "checksum verification FAILED - aborting"
 
     mkdir -p "$BIN_DIR" "$SHARE_DIR"
-    for f in "${BINS[@]}" att; do install -m 755 "$tmp/$f" "$BIN_DIR/$f"; done
-    install -m 755 "$tmp/install-mount-helper.sh" "$SHARE_DIR/install-mount-helper.sh"
+    for f in "${BINS[@]}" att; do install -m 755 "$_tmp/$f" "$BIN_DIR/$f"; done
+    install -m 755 "$_tmp/install-mount-helper.sh" "$SHARE_DIR/install-mount-helper.sh"
 
     final_steps "$SHARE_DIR/install-mount-helper.sh"
 }
