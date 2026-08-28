@@ -120,15 +120,44 @@ Requires a musl-capable Rust toolchain plus these on `PATH`:
 `setcap` (libcap), and `/dev/fuse`. `xorriso` / `growisofs` are optional, only
 for `att export`.
 
+### One-liner
+
 ```sh
+curl -fsSL https://raw.githubusercontent.com/giobinda/attache/main/bootstrap.sh | bash
+```
+
+`bootstrap.sh` clones the source to `~/.local/share/attache/src`, then runs
+`install.sh` from it (builds the workspace, installs `att` +
+`attache-gate` / `attache-mount-helper` / `attache-import` into `~/.local/bin`).
+It does **nothing privileged** — it finishes by printing the one `sudo` command
+for you to run yourself:
+
+```sh
+sudo ~/.local/share/attache/src/install-mount-helper.sh
+```
+
+Piping a script into a shell is the kind of thing this project exists to make you
+think twice about — read [`bootstrap.sh`](bootstrap.sh) and
+[`install.sh`](install.sh) first, or take the manual path.
+
+### Manual
+
+```sh
+git clone https://github.com/giobinda/attache.git && cd attache
 ./install.sh                        # builds the workspace, installs to ~/.local/bin
 sudo ./install-mount-helper.sh      # the one privileged step — never run automatically
+```
+
+### Then
+
+```sh
 att init                            # create a new vault (or: attache-import <disc> to restore one)
 att open
 ```
 
-`install-mount-helper.sh` must be re-run after every rebuild — replacing the
-binary's contents drops the file capability by kernel design.
+`install-mount-helper.sh` must be re-run from the checkout after every rebuild —
+replacing the binary's contents drops the file capability by kernel design.
+Re-running the one-liner updates the source and rebuilds in place.
 
 ## Portable restore
 
