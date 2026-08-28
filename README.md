@@ -13,6 +13,25 @@ prompt (over SSH, headless), unapproved access is denied by default.
 The vault auto-closes after 5 minutes idle, at logout or shutdown, and before
 suspend.
 
+> **Status:** early, single-author project. It performs privileged mount
+> operations — read the code and the [threat model](#threat-model) before
+> trusting it with anything that matters.
+
+## Quick start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/giobinda/attache/main/bootstrap.sh | bash
+sudo ~/.local/share/attache/install-mount-helper.sh
+att init
+att open
+```
+
+The one-liner downloads checksum-verified static binaries from the latest
+[release](https://github.com/giobinda/attache/releases) into `~/.local/bin` — no
+toolchain required. It installs nothing privileged; the `sudo` line is the one
+manual step. To build from source instead, run it with `ATTACHE_BUILD=source`,
+or see [Install](#install).
+
 ## The name
 
 An *attaché case* is the slim, locked briefcase a diplomatic attaché uses to
@@ -37,10 +56,6 @@ host machine — no system configuration, no database, no service to register:
 So your private working set — notes, keys, documents — moves with you: encrypted
 at rest, gated per application, on machines you did not have to set up or trust
 in advance.
-
-> **Status:** early, single-author project. It performs privileged mount
-> operations — read the code and the [threat model](#threat-model) before
-> trusting it with anything that matters.
 
 ## Components
 
@@ -115,38 +130,49 @@ touched by the gate operating on the backing directory directly.
 
 ## Install
 
-Requires a musl-capable Rust toolchain plus these on `PATH`:
+Runtime dependencies, on `PATH` either way:
 `gocryptfs`, `fusermount3`, `socat`, `zenity`, `gdbus` (glib2), `lsof`,
 `setcap` (libcap), and `/dev/fuse`. `xorriso` / `growisofs` are optional, only
 for `att export`.
 
-### One-liner
+### Prebuilt (default)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/giobinda/attache/main/bootstrap.sh | bash
 ```
 
-`bootstrap.sh` clones the source to `~/.local/share/attache/src`, then runs
-`install.sh` from it (builds the workspace, installs `att` +
-`attache-gate` / `attache-mount-helper` / `attache-import` into `~/.local/bin`).
+`bootstrap.sh` downloads the static musl binaries (`att`,
+`attache-gate`, `attache-mount-helper`, `attache-import`) from the latest GitHub
+release, verifies them against the release's `SHA256SUMS`, and installs them into
+`~/.local/bin`. `install-mount-helper.sh` goes to `~/.local/share/attache/`. No
+Rust toolchain needed. Pin a version with `ATTACHE_REF=v0.1.0`.
+
 It does **nothing privileged** — it finishes by printing the one `sudo` command
 for you to run yourself:
 
 ```sh
-sudo ~/.local/share/attache/src/install-mount-helper.sh
+sudo ~/.local/share/attache/install-mount-helper.sh
 ```
 
 Piping a script into a shell is the kind of thing this project exists to make you
-think twice about — read [`bootstrap.sh`](bootstrap.sh) and
-[`install.sh`](install.sh) first, or take the manual path.
+think twice about — read [`bootstrap.sh`](bootstrap.sh) first, verify the
+released binaries against `SHA256SUMS` yourself, or build from source.
 
-### Manual
+### From source
 
 ```sh
+# one-liner:
+curl -fsSL https://raw.githubusercontent.com/giobinda/attache/main/bootstrap.sh | ATTACHE_BUILD=source bash
+
+# or by hand:
 git clone https://github.com/giobinda/attache.git && cd attache
 ./install.sh                        # builds the workspace, installs to ~/.local/bin
 sudo ./install-mount-helper.sh      # the one privileged step — never run automatically
 ```
+
+Source builds also need a musl-capable Rust toolchain (`rustup target add
+x86_64-unknown-linux-musl`). The `bash` one-liner keeps the checkout at
+`~/.local/share/attache/src`; re-running it updates and rebuilds in place.
 
 ### Then
 
@@ -155,9 +181,8 @@ att init                            # create a new vault (or: attache-import <di
 att open
 ```
 
-`install-mount-helper.sh` must be re-run from the checkout after every rebuild —
-replacing the binary's contents drops the file capability by kernel design.
-Re-running the one-liner updates the source and rebuilds in place.
+`install-mount-helper.sh` must be re-run after every update — replacing the
+binary's contents drops the file capability by kernel design.
 
 ## Portable restore
 
