@@ -2,6 +2,26 @@
 
 All notable changes are recorded here. Every bug fix ships as a new release.
 
+## v0.1.2
+
+### Fixed
+- **Sandboxed apps (Flatpak / Snap / AppImage) could never be whitelisted** —
+  clicking *Always Allow* did nothing and the same file re-prompted forever.
+  The gate identified a caller by the resolved path of `/proc/<pid>/exe`
+  (`/app/freecad/bin/FreeCAD`), which only exists inside the app's own
+  namespace, so persisting or matching an approval failed with `ENOENT`.
+  Callers are now identified by the **SHA-256 of the binary's bytes**, read
+  through the `/proc/<pid>/exe` magic symlink (works across namespaces).
+
+### Changed
+- Whitelist and session cache match on the binary's content hash, not its
+  path. A byte-identical binary at another path is now also allowed; swapping
+  a binary's bytes still revokes its approval. The prompt still shows the
+  program name and path (plus a short hash) — you approve a name, not a hash.
+- `att allow --always <path>` hashes the file at that path; for a sandboxed
+  app you'd point it at the real host path, but the GUI *Always Allow* now
+  works without that.
+
 ## v0.1.1
 
 ### Fixed

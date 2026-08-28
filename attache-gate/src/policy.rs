@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::process_info::ProcessIdentity;
@@ -32,7 +32,11 @@ pub trait Prompter {
 /// [`Whitelist`], so approvals survive across mounts too.
 pub struct AuthPolicy<P: Prompter> {
     prompter: P,
-    cache: Mutex<HashMap<PathBuf, Decision>>,
+    /// Keyed on the binary's content hash (`ProcessIdentity::sha256`), same
+    /// as the persistent whitelist - so a swapped binary misses the cache
+    /// too, and two distinct binaries can't collide on a shared
+    /// namespace-local path like `/app/bin/foo`.
+    cache: Mutex<HashMap<String, Decision>>,
     whitelist: Arc<Mutex<Whitelist>>,
 }
 
@@ -55,25 +59,14 @@ impl<P: Prompter> AuthPolicy<P> {
     }
 
     pub fn decide(&self, identity: &ProcessIdentity, target: &Path) -> Decision {
-        // Checked - and its hash re-verified - on *every* call, never
-        // served from the session cache below: caching this would let a
-        // binary swapped out at an already-approved path silently inherit
-        // the old decision for the rest of the mount's lifetime, which is
-        // exactly what the hash-pinning in Whitelist::is_allowed exists to
-        // catch. The cache still helps for the common case (repeated
-        // access from the same already-verified whitelisted binary isn't
-        // actually free - it re-hashes the file - but it's the only way
-        // this guarantee holds every time, not just on first use).
-        // Split-lock: take only the recorded hash string under the lock,
-        // then release it before re-hashing the (possibly large) caller
-        // binary to compare. Holding `whitelist` across `hash_file` would
-        // serialise every gated access in the vault behind one multi-MB
-        // read+SHA256 - and the control socket (`control.rs`) wants this
-        // same lock too.
-        let expected = self.whitelist.lock().unwrap().expected_sha256(&identity.path);
-        if let Some(expected) = expected
-            && matches!(crate::whitelist::hash_file(&identity.path), Ok(h) if h == expected)
-        {
+        // Consulted on *every* call, never served from the session cache
+        // below: `identity.sha256` is a fresh hash of the caller's binary
+        // (recomputed by `ProcResolver::resolve` from `/proc/<pid>/exe` on
+        // every request), so a binary swapped out under an approved hash
+        // simply stops matching here - it can't inherit the old decision.
+        // The check itself is a cheap in-memory string compare now, so
+        // there's nothing expensive to hold the lock across.
+        if self.whitelist.lock().unwrap().is_allowed(identity) {
             return Decision::Allow;
         }
 
@@ -83,7 +76,7 @@ impl<P: Prompter> AuthPolicy<P> {
         // are answers to a live GUI prompt the user just saw, not a
         // persisted trust decision), so there's nothing it can silently
         // downgrade.
-        if let Some(decision) = self.cache.lock().unwrap().get(&identity.path) {
+        if let Some(decision) = self.cache.lock().unwrap().get(&identity.sha256) {
             return *decision;
         }
 
@@ -102,18 +95,15 @@ impl<P: Prompter> AuthPolicy<P> {
         match response {
             PromptResponse::AllowOnce => {
                 let decision = Decision::Allow;
-                self.cache.lock().unwrap().insert(identity.path.clone(), decision);
+                self.cache.lock().unwrap().insert(identity.sha256.clone(), decision);
                 decision
             }
             PromptResponse::AllowAlways => {
                 // Deliberately never inserted into `cache`: the whitelist
-                // check at the top of this function is now the source of
-                // truth for this path, re-verified (hash included) on
-                // every call. Caching a plain Allow here under the same
-                // key would let a binary later swapped out at this path
-                // fall through to a stale cache hit instead of being
-                // re-checked - exactly the bug this function's first
-                // check exists to prevent.
+                // check at the top of this function is the source of truth,
+                // and it keys on the same content hash the cache would.
+                // Persisting is what makes "Always" outlast the session;
+                // the cache only exists to skip re-prompting within it.
                 if let Err(e) = self.whitelist.lock().unwrap().add(identity) {
                     log::warn!(
                         "failed to persist whitelist entry for {}: {e}",
@@ -137,7 +127,7 @@ impl<P: Prompter> AuthPolicy<P> {
                     target
                 );
                 let decision = Decision::Deny;
-                self.cache.lock().unwrap().insert(identity.path.clone(), decision);
+                self.cache.lock().unwrap().insert(identity.sha256.clone(), decision);
                 decision
             }
         }
@@ -167,10 +157,15 @@ fn escape_markup(s: &str) -> String {
 }
 
 fn dialog_text(identity: &ProcessIdentity, target: &Path) -> String {
+    // The user decides on a recognisable name + path; the short hash makes
+    // it clear *which exact binary* an "Always Allow" will pin (the match
+    // is on the full hash, never the path).
+    let short_hash: String = identity.sha256.chars().take(12).collect();
     format!(
-        "{} ({}) wants to access:\n{}\n\nAllow?",
+        "{} ({})\nsha256: {}…\n\nwants to access:\n{}\n\nAllow?",
         escape_markup(&identity.comm),
         escape_markup(&identity.path.display().to_string()),
+        escape_markup(&short_hash),
         escape_markup(&target.display().to_string())
     )
 }
@@ -300,6 +295,7 @@ impl ControlConfirm for ZenityConfirm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread;
@@ -336,10 +332,28 @@ mod tests {
         Whitelist::load(tempfile::tempdir().unwrap().path())
     }
 
+    /// A synthetic identity for cache/prompt tests that don't care about a
+    /// real binary: the hash is derived from the string so it's stable and
+    /// unique per `bin`.
     fn identity(bin: &str) -> ProcessIdentity {
         ProcessIdentity {
             path: PathBuf::from(bin),
             comm: bin.to_string(),
+            sha256: format!("hash-of::{bin}"),
+        }
+    }
+
+    /// An identity built the way `ProcResolver::resolve` would: the hash is
+    /// of the file's real, current contents. Use this when a test swaps the
+    /// binary and needs the swap to be visible.
+    fn identity_at(path: &Path) -> ProcessIdentity {
+        ProcessIdentity {
+            path: path.to_path_buf(),
+            comm: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            sha256: crate::whitelist::hash_file(path).expect("hash the test binary"),
         }
     }
 
@@ -393,10 +407,7 @@ mod tests {
         let backing = tempfile::tempdir().unwrap();
         let bin_path = backing.path().join("trusted-tool");
         std::fs::write(&bin_path, b"a real binary").unwrap();
-        let bin = ProcessIdentity {
-            path: bin_path,
-            comm: "trusted-tool".to_string(),
-        };
+        let bin = identity_at(&bin_path);
 
         let policy = AuthPolicy::new(
             CountingPrompter::new(PromptResponse::AllowAlways),
@@ -455,29 +466,26 @@ mod tests {
         let backing = tempfile::tempdir().unwrap();
         let bin_path = backing.path().join("trusted-tool");
         std::fs::write(&bin_path, b"the real binary").unwrap();
-        let bin = ProcessIdentity {
-            path: bin_path.clone(),
-            comm: "trusted-tool".to_string(),
-        };
 
         let policy = AuthPolicy::new(
             SequencedPrompter::new([PromptResponse::AllowAlways, PromptResponse::Deny]),
             Whitelist::load(backing.path()),
         );
 
-        let first = policy.decide(&bin, Path::new("/vault/a.txt"));
+        let first = policy.decide(&identity_at(&bin_path), Path::new("/vault/a.txt"));
         assert_eq!(first, Decision::Allow);
         assert_eq!(policy.prompter.call_count(), 1);
 
         // attacker (or anything else able to write to this path) swaps
         // the trusted binary's content out from under its own approval,
-        // still within the same mount session.
+        // still within the same mount session. `resolve` re-hashes
+        // /proc/<pid>/exe every request, so the identity changes with it.
         std::fs::write(&bin_path, b"a malicious payload").unwrap();
 
         // must be re-prompted (not served the earlier session-cached
         // Allow) precisely because the hash no longer matches - and this
         // time the user says Deny.
-        let second = policy.decide(&bin, Path::new("/vault/b.txt"));
+        let second = policy.decide(&identity_at(&bin_path), Path::new("/vault/b.txt"));
         assert_eq!(second, Decision::Deny);
         assert_eq!(policy.prompter.call_count(), 2);
     }
@@ -524,10 +532,7 @@ mod tests {
         // occupy the prompter with a dialog for a *different* binary that
         // this test controls when (if ever) it gets answered
         let blocked_policy = Arc::clone(&policy);
-        let blocking_identity = ProcessIdentity {
-            path: block_path,
-            comm: "unknown".to_string(),
-        };
+        let blocking_identity = identity("/usr/bin/unknown");
         let handle = thread::spawn(move || {
             blocked_policy.decide(&blocking_identity, Path::new("/vault/b.txt"))
         });
@@ -600,6 +605,7 @@ mod tests {
         let identity = ProcessIdentity {
             path: PathBuf::from("/usr/bin/cat"),
             comm: "cat".to_string(),
+            sha256: "0".repeat(64),
         };
         // a malicious process can name a vault file (or itself) whatever
         // it likes before triggering access to it

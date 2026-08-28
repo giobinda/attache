@@ -269,19 +269,30 @@ fn cmd_allow_always(target: &Path) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     };
 
-    // Canonicalized to match what ProcResolver actually reports at
-    // runtime: /proc/<pid>/exe is always the fully symlink-resolved real
-    // path, so a whitelist entry keyed on anything else (a symlink path,
-    // a relative path) would silently never match.
+    // Canonicalize for a stable label, then match on a hash of the binary's
+    // bytes - the same value ProcResolver computes from /proc/<pid>/exe at
+    // runtime. (The whitelist no longer keys on the path.)
     let result = match std::fs::canonicalize(target) {
         Ok(canonical) => {
             let comm = canonical
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let sha256 = match attache_gate::whitelist::hash_file(&canonical) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!(
+                        "attache-mount-helper: {}: {e}",
+                        canonical.display()
+                    );
+                    unmount_backing(&backing);
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
             let identity = attache_gate::process_info::ProcessIdentity {
                 path: canonical.clone(),
                 comm,
+                sha256,
             };
             match attache_gate::whitelist::Whitelist::load(&backing).add(&identity) {
                 Ok(()) => {

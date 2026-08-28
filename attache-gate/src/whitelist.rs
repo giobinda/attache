@@ -19,11 +19,9 @@ pub const WHITELIST_FILENAME: &str = ".attache-gate-whitelist.json";
 struct WhitelistEntry {
     path: PathBuf,
     comm: String,
-    /// Hex-encoded SHA-256 of the binary's contents at the time it was
-    /// approved. Matching on this (not just `path`) means a binary later
-    /// swapped out at the same path - e.g. an attacker overwriting a
-    /// previously-trusted executable - loses its approval instead of
-    /// silently inheriting it.
+    /// Hex-encoded SHA-256 of the binary's contents at approval time. This
+    /// is the *only* field matched on: a binary later swapped out (same
+    /// path or not) no longer matches and loses its approval.
     sha256: String,
     added_at: u64,
 }
@@ -50,45 +48,39 @@ impl Whitelist {
         Self { file, entries }
     }
 
-    /// The hex SHA-256 recorded when the binary at `path` was approved, or
-    /// `None` if that path was never approved. Cheap: it only reads the
-    /// in-memory entry list, no hashing. Callers that hold this behind a
-    /// lock should take the string and release the lock *before* hashing
-    /// the (potentially large) binary to compare - see
-    /// `AuthPolicy::decide`.
-    pub fn expected_sha256(&self, path: &Path) -> Option<String> {
-        self.entries
-            .iter()
-            .find(|e| e.path == path)
-            .map(|e| e.sha256.clone())
+    /// True if any entry records this exact hex SHA-256. Cheap: in-memory
+    /// string compare, no file I/O.
+    pub fn contains_sha256(&self, sha256: &str) -> bool {
+        self.entries.iter().any(|e| e.sha256 == sha256)
     }
 
-    /// True if `identity`'s binary was previously approved *and* its
-    /// current on-disk contents still match the hash recorded at approval
-    /// time. Hashes the binary, so don't call it with a hot lock held;
-    /// [`expected_sha256`](Self::expected_sha256) + [`hash_file`] is the
-    /// split-lock form.
+    /// True if `identity`'s binary contents were previously approved.
+    ///
+    /// Matches on the content hash alone, not the path: the hash is computed
+    /// once by `ProcResolver::resolve` from `/proc/<pid>/exe` (which works
+    /// across mount namespaces), so this holds for sandboxed callers -
+    /// Flatpak/Snap/AppImage - whose reported path (`/app/...`) doesn't
+    /// exist outside their own namespace. Swapping the binary's bytes
+    /// changes the hash and revokes the approval; the stored `path`/`comm`
+    /// are advisory labels only.
     pub fn is_allowed(&self, identity: &ProcessIdentity) -> bool {
-        let Some(expected) = self.expected_sha256(&identity.path) else {
-            return false;
-        };
-        matches!(hash_file(&identity.path), Ok(hash) if hash == expected)
+        self.contains_sha256(&identity.sha256)
     }
 
-    /// Records `identity` as always-allowed and persists the whitelist to
-    /// disk. Hashes the binary fresh (rather than trusting a caller-supplied
-    /// hash) so the stored value always reflects what was actually approved.
+    /// Records `identity`'s binary as always-allowed (keyed on its content
+    /// hash) and persists the whitelist. Trusts `identity.sha256` - the
+    /// caller computed it, either from `/proc/<pid>/exe` (`resolve`) or by
+    /// hashing a real path (`att allow --always`).
     pub fn add(&mut self, identity: &ProcessIdentity) -> io::Result<()> {
-        let sha256 = hash_file(&identity.path)?;
         let added_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.entries.retain(|e| e.path != identity.path);
+        self.entries.retain(|e| e.sha256 != identity.sha256);
         self.entries.push(WhitelistEntry {
             path: identity.path.clone(),
             comm: identity.comm.clone(),
-            sha256,
+            sha256: identity.sha256.clone(),
             added_at,
         });
         self.persist()
@@ -115,14 +107,26 @@ impl Whitelist {
     }
 }
 
-/// Hex-encoded SHA-256 of the file at `path`. Reads the whole file, so
-/// keep it off any hot lock path.
-pub(crate) fn hash_file(path: &Path) -> io::Result<String> {
-    let bytes = fs::read(path)?;
+/// Hex-encoded SHA-256 of everything `r` yields. Streamed, so it's fine on
+/// a large binary; used to hash `/proc/<pid>/exe` (an openable magic
+/// symlink) as well as plain files.
+pub fn hash_reader<R: io::Read>(mut r: R) -> io::Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     let digest = hasher.finalize();
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Hex-encoded SHA-256 of the file at `path`.
+pub fn hash_file(path: &Path) -> io::Result<String> {
+    hash_reader(fs::File::open(path)?)
 }
 
 #[cfg(test)]
@@ -135,10 +139,15 @@ mod tests {
         path
     }
 
+    /// Mirrors what `ProcResolver::resolve` builds: the hash is of the
+    /// file's current contents. Falls back to a path-derived placeholder if
+    /// the path doesn't exist, so tests can model a sandboxed binary.
     fn identity(path: PathBuf) -> ProcessIdentity {
+        let sha256 = hash_file(&path).unwrap_or_else(|_| format!("no-file::{}", path.display()));
         ProcessIdentity {
             path,
             comm: "test".to_string(),
+            sha256,
         }
     }
 
@@ -189,16 +198,41 @@ mod tests {
     }
 
     #[test]
-    fn same_name_different_path_is_not_allowed() {
+    fn same_contents_different_path_is_allowed() {
+        // Deliberate model change (v0.1.2): approval is keyed on the
+        // binary's *bytes*, not its path - a path can't be a boundary for
+        // sandboxed callers whose /proc/<pid>/exe is namespace-local. A
+        // byte-identical binary elsewhere is the same program, so it's
+        // allowed; different bytes are not (see below).
         let backing = tempfile::tempdir().unwrap();
         let trusted = write_bin(backing.path(), "cat", b"binary-a");
         let mut whitelist = Whitelist::load(backing.path());
         whitelist.add(&identity(trusted)).unwrap();
 
-        let impostor_dir = tempfile::tempdir().unwrap();
-        let impostor = write_bin(impostor_dir.path(), "cat", b"binary-a");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let same_bytes = write_bin(elsewhere.path(), "cat", b"binary-a");
+        assert!(whitelist.is_allowed(&identity(same_bytes)));
 
-        assert!(!whitelist.is_allowed(&identity(impostor)));
+        let different_bytes = write_bin(elsewhere.path(), "dog", b"binary-b");
+        assert!(!whitelist.is_allowed(&identity(different_bytes)));
+    }
+
+    #[test]
+    fn approval_matches_by_hash_even_when_the_path_no_longer_resolves() {
+        // The Flatpak/Snap case: /proc/<pid>/exe reads `/app/.../FreeCAD`,
+        // which doesn't exist in the gate's namespace. `add` must not need
+        // to touch that path, and `is_allowed` must still match it later.
+        let backing = tempfile::tempdir().unwrap();
+        let sandboxed = ProcessIdentity {
+            path: PathBuf::from("/app/freecad/bin/FreeCAD"),
+            comm: "FreeCAD".to_string(),
+            sha256: "a".repeat(64),
+        };
+
+        let mut whitelist = Whitelist::load(backing.path());
+        whitelist.add(&sandboxed).unwrap();
+        assert!(whitelist.is_allowed(&sandboxed));
+        assert!(Whitelist::load(backing.path()).is_allowed(&sandboxed));
     }
 
     #[test]

@@ -93,10 +93,10 @@ fn allow_always<C: ControlConfirm>(
     confirm: &C,
     target: &Path,
 ) -> String {
-    // Canonicalized to match what ProcessResolver actually reports at
-    // runtime (see attache-mount-helper's allow-always for the same
-    // reasoning): /proc/<pid>/exe is always the fully symlink-resolved
-    // real path.
+    // A real filesystem path is required here (there's no pid to read
+    // `/proc/<pid>/exe` from). Canonicalize it for a stable label, then
+    // hash its contents - that hash is what the whitelist matches on, the
+    // same value `ProcResolver::resolve` would compute for this binary.
     let canonical = match std::fs::canonicalize(target) {
         Ok(p) => p,
         Err(e) => return format!("ERROR {}: {e}", target.display()),
@@ -107,6 +107,10 @@ fn allow_always<C: ControlConfirm>(
         return "DENIED not confirmed".to_string();
     }
 
+    let sha256 = match crate::whitelist::hash_file(&canonical) {
+        Ok(h) => h,
+        Err(e) => return format!("ERROR {}: {e}", canonical.display()),
+    };
     let comm = canonical
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -114,6 +118,7 @@ fn allow_always<C: ControlConfirm>(
     let identity = ProcessIdentity {
         path: canonical.clone(),
         comm,
+        sha256,
     };
     match whitelist.lock().unwrap().add(&identity) {
         Ok(()) => format!("OK whitelisted {}", canonical.display()),
@@ -160,6 +165,15 @@ mod tests {
         }
     }
 
+    /// The identity `allow_always` builds internally: canonical path + a
+    /// hash of the binary's bytes.
+    fn identity_for(bin: &Path) -> ProcessIdentity {
+        let path = std::fs::canonicalize(bin).unwrap();
+        let sha256 = crate::whitelist::hash_file(&path).unwrap();
+        let comm = path.file_name().unwrap().to_string_lossy().into_owned();
+        ProcessIdentity { path, comm, sha256 }
+    }
+
     #[test]
     fn allow_always_confirmed_whitelists_the_binary() {
         let backing = tempfile::tempdir().unwrap();
@@ -171,10 +185,7 @@ mod tests {
         let response = allow_always(&whitelist, &confirm, &bin);
 
         assert!(response.starts_with("OK"), "unexpected response: {response}");
-        let identity = ProcessIdentity {
-            path: std::fs::canonicalize(&bin).unwrap(),
-            comm: "trusted-tool".to_string(),
-        };
+        let identity = identity_for(&bin);
         assert!(whitelist.lock().unwrap().is_allowed(&identity));
     }
 
@@ -189,10 +200,7 @@ mod tests {
         let response = allow_always(&whitelist, &confirm, &bin);
 
         assert_eq!(response, "DENIED not confirmed");
-        let identity = ProcessIdentity {
-            path: std::fs::canonicalize(&bin).unwrap(),
-            comm: "shady-tool".to_string(),
-        };
+        let identity = identity_for(&bin);
         assert!(!whitelist.lock().unwrap().is_allowed(&identity));
     }
 
@@ -217,10 +225,7 @@ mod tests {
         let backing = tempfile::tempdir().unwrap();
         let bin = backing.path().join("trusted-tool");
         std::fs::write(&bin, b"a real binary").unwrap();
-        let identity = ProcessIdentity {
-            path: std::fs::canonicalize(&bin).unwrap(),
-            comm: "trusted-tool".to_string(),
-        };
+        let identity = identity_for(&bin);
         let mut w = Whitelist::load(backing.path());
         w.add(&identity).unwrap();
         let whitelist = Arc::new(Mutex::new(w));
@@ -236,10 +241,7 @@ mod tests {
         let backing = tempfile::tempdir().unwrap();
         let bin = backing.path().join("trusted-tool");
         std::fs::write(&bin, b"a real binary").unwrap();
-        let identity = ProcessIdentity {
-            path: std::fs::canonicalize(&bin).unwrap(),
-            comm: "trusted-tool".to_string(),
-        };
+        let identity = identity_for(&bin);
         let mut w = Whitelist::load(backing.path());
         w.add(&identity).unwrap();
         let whitelist = Arc::new(Mutex::new(w));
