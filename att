@@ -729,17 +729,65 @@ cmd_reset_whitelist() {
 # in a CLI-only/headless environment specifically because there's no GUI
 # to show ZenityPrompter's live dialog at all, so anything not pre-approved
 # here is denied by default - see `att denied` for what that's affected.
+# Renders the TSV the gate / mount-helper emit
+# (<sha256>\t<added_at>\t<comm>\t<path>) as a table. Filtering to
+# hash-prefixed lines drops any mount progress chatter that shares stdout.
+print_whitelist() {
+    local any=0 sha ts comm path
+    while IFS=$'\t' read -r sha ts comm path; do
+        [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || continue
+        if [[ "$any" == 0 ]]; then
+            printf '%-14s  %-16s  %-16s  %s\n' "SHA256" "APPROVED" "NAME" "PATH"
+            any=1
+        fi
+        local when
+        when="$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$ts")"
+        printf '%-14s  %-16s  %-16s  %s\n' "${sha:0:12}.." "$when" "$comm" "$path"
+    done
+    [[ "$any" == 0 ]] && echo "att: whitelist is empty"
+}
+
 cmd_allow() {
-    local always=0 target_path=""
+    local always=0 list=0 target_path=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --always) always=1; shift ;;
+            --list) list=1; shift ;;
             -*) echo "att: unknown option: $1" >&2; exit 1 ;;
             *) target_path="$1"; shift ;;
         esac
     done
+
+    if [[ "$list" == 1 ]]; then
+        if is_mounted; then
+            command -v socat >/dev/null 2>&1 || {
+                echo "att: socat is required to reach the running attache while it's open" >&2
+                exit 1
+            }
+            [[ -S "$CONTROL_SOCKET" ]] || {
+                echo "att: control socket not found at $CONTROL_SOCKET" >&2
+                exit 1
+            }
+            local out
+            out="$(printf 'LIST-WHITELIST\n' | socat - "UNIX-CONNECT:$CONTROL_SOCKET" 2>&1)"
+            if [[ "$out" == ERROR* ]]; then
+                echo "att: $out" >&2
+                exit 1
+            fi
+            printf '%s\n' "$out" | print_whitelist
+        else
+            local out
+            if ! out="$(run_helper_with_password list-whitelist)"; then
+                echo "att: could not read the whitelist" >&2
+                exit 1
+            fi
+            printf '%s\n' "$out" | print_whitelist
+        fi
+        exit 0
+    fi
+
     if [[ "$always" != 1 || -z "$target_path" ]]; then
-        echo "att: usage: att allow --always <path-to-binary>" >&2
+        echo "att: usage: att allow --always <path-to-binary>  |  att allow --list" >&2
         exit 1
     fi
     if [[ ! -e "$target_path" ]]; then
@@ -812,6 +860,9 @@ Usage: att <command> [args]
   allow --always <path>   Pre-approve a binary for always-allowed Attache
                           access without waiting for a live prompt. Works
                           whether Attache is currently open or closed.
+  allow --list            Show the "always allow" whitelist: for each
+                          approved binary its content hash, when it was
+                          approved, its name and path. Open or closed.
   reset-whitelist [-y]    Remove every "always allow" approval - every
                           app will need to be re-approved on its next
                           access. -y skips the confirmation prompt.

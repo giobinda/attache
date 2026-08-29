@@ -318,11 +318,25 @@ fn cmd_allow_always(target: &Path) -> std::process::ExitCode {
     result
 }
 
+/// Prints the vault's whitelist as TSV (see `Whitelist::tsv`) - the
+/// closed-vault counterpart to the control socket's `LIST-WHITELIST`. Needs
+/// the same isolated mount as the other maintenance subcommands. The
+/// gocryptfs mount above may print progress lines here too; `att` filters
+/// stdout to the `<64-hex>\t...` entry lines.
+fn cmd_list_whitelist() -> std::process::ExitCode {
+    let Ok(backing) = enter_namespace_and_mount_backing() else {
+        return std::process::ExitCode::FAILURE;
+    };
+    print!("{}", attache_gate::whitelist::Whitelist::load(&backing).tsv());
+    unmount_backing(&backing);
+    std::process::ExitCode::SUCCESS
+}
+
 /// Nothing else runs in this namespace once the caller exits for
-/// `reset-whitelist`/`allow-always` (there was never an attache-gate here to
-/// inherit it), so it's this process's job to unmount cleanly rather than
-/// leaving it for the namespace's own teardown - same reasoning as
-/// attache-gate's own backing-dir cleanup in main.rs.
+/// `reset-whitelist`/`allow-always`/`list-whitelist` (there was never an
+/// attache-gate here to inherit it), so it's this process's job to unmount
+/// cleanly rather than leaving it for the namespace's own teardown - same
+/// reasoning as attache-gate's own backing-dir cleanup in main.rs.
 fn unmount_backing(backing: &Path) {
     match Command::new("fusermount").arg("-u").arg(backing).status() {
         Ok(s) if s.success() => {}
@@ -338,9 +352,10 @@ fn main() -> std::process::ExitCode {
         Some("run") if args.len() == 2 => cmd_run(),
         Some("reset-whitelist") if args.len() == 2 => cmd_reset_whitelist(),
         Some("allow-always") if args.len() == 3 => cmd_allow_always(Path::new(&args[2])),
+        Some("list-whitelist") if args.len() == 2 => cmd_list_whitelist(),
         _ => {
             eprintln!(
-                "usage: {} setup|run|reset-whitelist|allow-always <path>",
+                "usage: {} setup|run|reset-whitelist|allow-always <path>|list-whitelist",
                 args.first().map(String::as_str).unwrap_or("attache-mount-helper")
             );
             std::process::ExitCode::FAILURE

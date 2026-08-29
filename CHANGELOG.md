@@ -2,6 +2,15 @@
 
 All notable changes are recorded here. Every bug fix ships as a new release.
 
+## v0.1.3
+
+### Added
+- `att allow --list` — show the "always allow" whitelist: each approved
+  binary's content hash, approval time, name, and path. Works whether the
+  vault is open (over the control socket) or closed (brief bootstrap mount,
+  same as `att allow --always`). Read-only, so it isn't gated behind a
+  confirmation dialog.
+
 ## v0.1.2
 
 ### Fixed

@@ -86,6 +86,26 @@ impl Whitelist {
         self.persist()
     }
 
+    /// One `<sha256>\t<added_at>\t<comm>\t<path>` line per entry, oldest
+    /// first, for `att allow --list` to render. Empty string if there are
+    /// no entries.
+    pub fn tsv(&self) -> String {
+        let mut entries: Vec<&WhitelistEntry> = self.entries.iter().collect();
+        entries.sort_by_key(|e| e.added_at);
+        entries
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}\t{}\t{}\t{}\n",
+                    e.sha256,
+                    e.added_at,
+                    e.comm,
+                    e.path.display()
+                )
+            })
+            .collect()
+    }
+
     /// Removes every entry and persists the (now empty) whitelist to disk
     /// - used by the control socket's RESET-WHITELIST, where (unlike the
     /// closed-vault `att reset-whitelist` path) there's a live
@@ -233,6 +253,37 @@ mod tests {
         whitelist.add(&sandboxed).unwrap();
         assert!(whitelist.is_allowed(&sandboxed));
         assert!(Whitelist::load(backing.path()).is_allowed(&sandboxed));
+    }
+
+    #[test]
+    fn tsv_lists_entries_oldest_first_and_is_empty_when_there_are_none() {
+        let backing = tempfile::tempdir().unwrap();
+        let mut whitelist = Whitelist::load(backing.path());
+        assert_eq!(whitelist.tsv(), "");
+
+        whitelist
+            .add(&ProcessIdentity {
+                path: PathBuf::from("/app/b/newer"),
+                comm: "newer".to_string(),
+                sha256: "b".repeat(64),
+            })
+            .unwrap();
+        // force an older added_at on the first entry so ordering is testable
+        whitelist.entries[0].added_at = 100;
+        whitelist
+            .add(&ProcessIdentity {
+                path: PathBuf::from("/usr/bin/older"),
+                comm: "older".to_string(),
+                sha256: "a".repeat(64),
+            })
+            .unwrap();
+        whitelist.entries[1].added_at = 50;
+
+        let tsv = whitelist.tsv();
+        let lines: Vec<&str> = tsv.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], format!("{}\t50\tolder\t/usr/bin/older", "a".repeat(64)));
+        assert_eq!(lines[1], format!("{}\t100\tnewer\t/app/b/newer", "b".repeat(64)));
     }
 
     #[test]

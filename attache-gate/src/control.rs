@@ -81,6 +81,8 @@ fn handle_connection<C: ControlConfirm>(
         allow_always(whitelist, confirm, Path::new(path))
     } else if line == "RESET-WHITELIST" {
         reset_whitelist(whitelist, confirm)
+    } else if line == "LIST-WHITELIST" {
+        list_whitelist(whitelist)
     } else {
         "ERROR unknown command".to_string()
     };
@@ -123,6 +125,19 @@ fn allow_always<C: ControlConfirm>(
     match whitelist.lock().unwrap().add(&identity) {
         Ok(()) => format!("OK whitelisted {}", canonical.display()),
         Err(e) => format!("ERROR {e}"),
+    }
+}
+
+/// Returns the current whitelist as TSV (see `Whitelist::tsv`). Read-only,
+/// so - unlike `ALLOW-ALWAYS` / `RESET-WHITELIST` - it isn't gated behind a
+/// `ControlConfirm` dialog: it grants no capability and changes no state,
+/// and the 0600 socket already restricts it to the vault's own user.
+fn list_whitelist(whitelist: &Arc<Mutex<Whitelist>>) -> String {
+    let tsv = whitelist.lock().unwrap().tsv();
+    if tsv.is_empty() {
+        "OK empty".to_string()
+    } else {
+        format!("OK\n{}", tsv.trim_end())
     }
 }
 
@@ -218,6 +233,21 @@ mod tests {
             0,
             "should validate the path before ever bothering the user with a confirmation"
         );
+    }
+
+    #[test]
+    fn list_whitelist_returns_entries_without_a_confirmation() {
+        let backing = tempfile::tempdir().unwrap();
+        let bin = backing.path().join("trusted-tool");
+        std::fs::write(&bin, b"a real binary").unwrap();
+
+        let whitelist = Arc::new(Mutex::new(Whitelist::load(backing.path())));
+        assert_eq!(list_whitelist(&whitelist), "OK empty");
+
+        whitelist.lock().unwrap().add(&identity_for(&bin)).unwrap();
+        let response = list_whitelist(&whitelist);
+        assert!(response.starts_with("OK\n"), "unexpected: {response}");
+        assert!(response.contains("\ttrusted-tool\t"), "unexpected: {response}");
     }
 
     #[test]

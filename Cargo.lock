@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "attache-gate"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "env_logger",
  "filetime",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "attache-import"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "sha2",
  "tempfile",
