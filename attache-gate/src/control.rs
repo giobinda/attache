@@ -18,7 +18,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::passthrough_fs::ActivityMonitor;
 use crate::policy::ControlConfirm;
 use crate::process_info::ProcessIdentity;
 use crate::whitelist::Whitelist;
@@ -30,8 +32,12 @@ pub const SOCKET_NAME: &str = "control.sock";
 /// on a background thread for as long as the process lives. Binding
 /// failure is logged, not fatal - the mount still works fine without this,
 /// just without the open-vault fast path for `att allow`/`reset-whitelist`.
-pub fn spawn<C>(state_dir: PathBuf, whitelist: Arc<Mutex<Whitelist>>, confirm: C)
-where
+pub fn spawn<C>(
+    state_dir: PathBuf,
+    whitelist: Arc<Mutex<Whitelist>>,
+    activity: ActivityMonitor,
+    confirm: C,
+) where
     C: ControlConfirm + Send + Sync + 'static,
 {
     let socket_path = state_dir.join(SOCKET_NAME);
@@ -55,7 +61,7 @@ where
 
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            handle_connection(stream, &whitelist, &confirm);
+            handle_connection(stream, &whitelist, &activity, &confirm);
         }
     });
 }
@@ -63,6 +69,7 @@ where
 fn handle_connection<C: ControlConfirm>(
     stream: UnixStream,
     whitelist: &Arc<Mutex<Whitelist>>,
+    activity: &ActivityMonitor,
     confirm: &C,
 ) {
     let Ok(cloned) = stream.try_clone() else {
@@ -83,6 +90,8 @@ fn handle_connection<C: ControlConfirm>(
         reset_whitelist(whitelist, confirm)
     } else if line == "LIST-WHITELIST" {
         list_whitelist(whitelist)
+    } else if line == "STATUS" {
+        status(activity)
     } else {
         "ERROR unknown command".to_string()
     };
@@ -139,6 +148,22 @@ fn list_whitelist(whitelist: &Arc<Mutex<Whitelist>>) -> String {
     } else {
         format!("OK\n{}", tsv.trim_end())
     }
+}
+
+/// `OK <seconds-since-last-vault-I/O> <open-handle-count>` - consumed by
+/// `att`'s idle-timeout manager instead of it sampling `lsof +D` / mtime
+/// from outside the mount (which misses a media player streaming a track
+/// it opened, buffered, and closed between two 5-minutely checks). A
+/// non-zero handle count, or an idle time under the manager's window,
+/// means "keep the vault open". Read-only, so - like `LIST-WHITELIST` -
+/// it isn't gated behind a `ControlConfirm` dialog.
+fn status(activity: &ActivityMonitor) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let idle = now.saturating_sub(activity.last_activity_secs());
+    format!("OK {idle} {}", activity.open_handles())
 }
 
 fn reset_whitelist<C: ControlConfirm>(whitelist: &Arc<Mutex<Whitelist>>, confirm: &C) -> String {

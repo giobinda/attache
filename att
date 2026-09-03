@@ -119,9 +119,25 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOGFILE"
 }
 
-# Activity = any file under the mount modified since the last check, or
-# any file under the mount currently held open by a process (editor, etc).
+# Activity = the running gate reports a recent read/write/open in the
+# vault, or still has a file handle open. Asking the gate over the control
+# socket (rather than sampling mtime + `lsof +D` from outside the mount)
+# catches a media player that opens a track, buffers it, and closes the fd
+# well within one CHECK_INTERVAL_MIN window - an outside sample sees
+# nothing open and nothing modified at that instant and wrongly tears the
+# vault down mid-playlist. STATUS replies "OK <idle-seconds> <open-handles>".
+# Falls back to the old mtime + `lsof +D` heuristic if the socket can't be
+# reached (no socat, gate too old, socket gone).
 has_activity() {
+    local resp idle handles
+    if command -v socat >/dev/null 2>&1 && [[ -S "$CONTROL_SOCKET" ]] \
+        && resp="$(printf 'STATUS\n' | socat - "UNIX-CONNECT:$CONTROL_SOCKET" 2>/dev/null)" \
+        && [[ "$resp" == "OK "* ]]; then
+        read -r _ idle handles <<<"$resp"
+        [[ "$handles" =~ ^[0-9]+$ && "$handles" -gt 0 ]] && return 0
+        [[ "$idle" =~ ^[0-9]+$ && "$idle" -lt $((CHECK_INTERVAL_MIN * 60)) ]] && return 0
+        return 1
+    fi
     if find "$REAL_MOUNTPOINT" -newer "$STAMPFILE" -print -quit 2>/dev/null | grep -q .; then
         return 0
     fi

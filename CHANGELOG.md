@@ -2,6 +2,40 @@
 
 All notable changes are recorded here. Every bug fix ships as a new release.
 
+## v0.1.5
+
+### Fixed
+- **The vault auto-closed while it was still in use** — e.g. a music
+  player working through a playlist. The idle check ran every 5 minutes
+  and looked for a file modified since the last check (`find -newer`) or
+  one held open right then (`lsof +D`). A player that opens a track,
+  buffers it, and closes the descriptor changes no mtime and holds
+  nothing open at the instant the check fires, so a 5-minute window could
+  catch a gap and tear the mount down mid-song. The gate now timestamps
+  every `open`/`create`/`read`/`write` and exposes it, plus the live
+  open-handle count, over the control socket (`STATUS`); `att` asks the
+  gate instead of sampling from outside the mount. The old `find`/`lsof`
+  heuristic stays as a fallback for when the socket can't be reached.
+
+## v0.1.4
+
+### Fixed
+- **Copying a folder into the vault from a file manager failed with "not
+  enough space".** The gate never implemented `statfs`, so the mount fell
+  back to `fuser`'s default reply of zero blocks total and zero free. KDE's
+  KIO copy job sums the source size and checks it against the destination's
+  free space before writing anything, so every folder drag into `~/attache`
+  in Dolphin was refused up front (a plain `cp`, which does no such check,
+  worked). `statfs` now forwards the backing filesystem's real numbers.
+- **Symlinks in the vault were unreadable and uncreatable.** The gate
+  implemented neither `readlink`, `symlink`, nor `link`, so resolving a
+  symlink returned `ENOSYS`, and creating a symlink or hard link failed
+  with `EPERM`. This broke recursive copies of any tree containing a
+  symlink, `git` checkouts, tarball extraction, and editors that
+  canonicalize paths. `readlink` is ungated (metadata read, like
+  `getattr`); `symlink`/`link` are gated on the new name's path like
+  `create`/`mkdir`.
+
 ## v0.1.3
 
 ### Added

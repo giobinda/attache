@@ -46,7 +46,13 @@ fn main() -> ExitCode {
     match backing.parent() {
         Some(state_dir) => {
             let whitelist = fs.whitelist_handle();
-            attache_gate::control::spawn(state_dir.to_path_buf(), whitelist, ZenityConfirm);
+            let activity = fs.activity_monitor();
+            attache_gate::control::spawn(
+                state_dir.to_path_buf(),
+                whitelist,
+                activity,
+                ZenityConfirm,
+            );
         }
         None => eprintln!(
             "warning: could not determine state dir from {}; control socket not started",

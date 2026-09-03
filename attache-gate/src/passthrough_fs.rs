@@ -12,7 +12,7 @@ use filetime::FileTime;
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
     WriteFlags,
 };
 
@@ -33,6 +33,45 @@ fn is_protected(path: &std::path::Path) -> bool {
     path.file_name() == Some(OsStr::new(WHITELIST_FILENAME))
 }
 
+/// Unix-epoch seconds now, saturating to 0 if the clock is before the
+/// epoch (it isn't).
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A read-only view of vault activity for the control socket
+/// (`control.rs`), so `att`'s idle-timeout manager can ask the running
+/// gate "is anything actually using the vault right now?" rather than
+/// sampling `lsof`/mtime from outside the mount. An outside sample misses
+/// a media player that opened a track, buffered it, and closed the fd
+/// between two of the manager's 5-minutely checks - which used to get the
+/// vault torn down mid-playlist.
+#[derive(Clone)]
+pub struct ActivityMonitor {
+    last_activity: Arc<AtomicU64>,
+    handles: Arc<Mutex<HashMap<u64, Arc<File>>>>,
+}
+
+impl ActivityMonitor {
+    /// Unix-epoch seconds of the most recent `open`/`create`/`read`/`write`
+    /// through the mount. Initialised to mount time, so a vault nobody has
+    /// touched yet still reports a sane "idle for N seconds".
+    pub fn last_activity_secs(&self) -> u64 {
+        self.last_activity.load(Ordering::Relaxed)
+    }
+
+    /// How many file handles are open in the vault right now. Non-zero
+    /// means some process is holding a file open (an editor with a buffer,
+    /// a player mid-track) even if no read/write has crossed the gate
+    /// within the idle window.
+    pub fn open_handles(&self) -> usize {
+        self.handles.lock().unwrap().len()
+    }
+}
+
 /// A FUSE filesystem that transparently forwards every operation to
 /// `backing_root`, except that `open`/`create`/`setattr` are gated behind
 /// an [`AuthPolicy`] decision keyed on the calling process's binary.
@@ -42,8 +81,14 @@ pub struct PassthroughFs<P: Prompter, R: ProcessResolver> {
     // under the lock and then do the backing I/O with the lock released -
     // otherwise every read/write in the vault serialises through this one
     // mutex for the whole duration of a gocryptfs-backed transfer.
-    handles: Mutex<HashMap<u64, Arc<File>>>,
+    // `Arc<Mutex<..>>` (not a bare `Mutex`) so `ActivityMonitor` can read
+    // the live handle count over the control socket.
+    handles: Arc<Mutex<HashMap<u64, Arc<File>>>>,
     next_fh: AtomicU64,
+    // Bumped to `now_secs()` on every gated `open`/`create` and every
+    // `read`/`write` that moves bytes. `att`'s idle check reads this via
+    // the control socket instead of guessing from `lsof`/mtime.
+    last_activity: Arc<AtomicU64>,
     auth: AuthPolicy<P>,
     resolver: R,
 }
@@ -53,11 +98,27 @@ impl<P: Prompter, R: ProcessResolver> PassthroughFs<P, R> {
         let whitelist = Whitelist::load(&backing_root);
         Self {
             inodes: Mutex::new(InodeTable::new(backing_root)),
-            handles: Mutex::new(HashMap::new()),
+            handles: Arc::new(Mutex::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
+            last_activity: Arc::new(AtomicU64::new(now_secs())),
             auth: AuthPolicy::new(prompter, whitelist),
             resolver,
         }
+    }
+
+    /// A read-only activity view for the control socket (`control.rs`),
+    /// backing `att`'s idle-timeout check.
+    pub fn activity_monitor(&self) -> ActivityMonitor {
+        ActivityMonitor {
+            last_activity: Arc::clone(&self.last_activity),
+            handles: Arc::clone(&self.handles),
+        }
+    }
+
+    /// Records "the vault was just used" for the idle timeout. Cheap
+    /// enough (one relaxed atomic store) to call on every read/write.
+    fn mark_activity(&self) {
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
     }
 
     /// A shared handle to this mount's whitelist, for the control socket
@@ -167,6 +228,26 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
         }
     }
 
+    // Read-only, like `getattr`/`readdir`: resolving a symlink reveals only
+    // its target string, so it's not gated. Without it the kernel returns
+    // ENOSYS for every `readlink`/`realpath` on a symlink in the vault, and
+    // anything walking a path that passes through one (a recursive copy
+    // re-creating links, `git`, an editor's canonicalize step) fails.
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let Some(path) = self.path_of(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if is_protected(&path) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        match fs::read_link(&path) {
+            Ok(target) => reply.data(target.as_os_str().as_bytes()),
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
     // Handles truncate (size), chmod (mode), chown (uid/gid) and utimens
     // (atime/mtime) - anything else (macOS-only crtime/chgtime/bkuptime/
     // flags) is ignored, matching the default no-op on Linux. Gated the
@@ -249,6 +330,42 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
             Ok(meta) => reply.attr(&TTL, &attr_from_metadata(ino, &meta)),
             Err(e) => reply.error(e.into()),
         }
+    }
+
+    // Report the backing filesystem's real free-space numbers. `fuser`'s
+    // default `statfs` replies with zero blocks total and zero free, which
+    // makes every space-aware caller believe the vault is full: KDE's KIO
+    // copy job sums the source size and checks it against the destination's
+    // free space *before* writing anything, so dragging a folder into the
+    // vault in Dolphin fails outright with "not enough space" while a
+    // plain `cp` (which never asks) works fine.
+    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        let path = self
+            .path_of(ino)
+            .or_else(|| self.path_of(INodeNo::ROOT))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let c_path = match CString::new(path.as_os_str().as_bytes()) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+            reply.error(std::io::Error::last_os_error().into());
+            return;
+        }
+        reply.statfs(
+            st.f_blocks as u64,
+            st.f_bfree as u64,
+            st.f_bavail as u64,
+            st.f_files as u64,
+            st.f_ffree as u64,
+            st.f_bsize as u32,
+            st.f_namemax as u32,
+            st.f_frsize as u32,
+        );
     }
 
     fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -337,6 +454,7 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
             Ok(file) => {
                 let fh = self.alloc_fh();
                 self.handles.lock().unwrap().insert(fh, Arc::new(file));
+                self.mark_activity();
                 reply.opened(FileHandle(fh), FopenFlags::empty());
             }
             Err(e) => reply.error(e.into()),
@@ -376,6 +494,7 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
                     let attr = attr_from_metadata(ino, &meta);
                     let fh = self.alloc_fh();
                     self.handles.lock().unwrap().insert(fh, Arc::new(file));
+                    self.mark_activity();
                     reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
                 }
                 Err(e) => reply.error(e.into()),
@@ -408,6 +527,7 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
         let mut buf = vec![0u8; size as usize];
         match file.read_at(&mut buf, offset) {
             Ok(n) => {
+                self.mark_activity();
                 buf.truncate(n);
                 reply.data(&buf);
             }
@@ -438,7 +558,10 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
             }
         };
         match file.write_at(data, offset) {
-            Ok(n) => reply.written(n as u32),
+            Ok(n) => {
+                self.mark_activity();
+                reply.written(n as u32);
+            }
             Err(e) => reply.error(e.into()),
         }
     }
@@ -484,6 +607,71 @@ impl<P: Prompter + Send + Sync + 'static, R: ProcessResolver + Send + Sync + 'st
                 Ok(meta) => {
                     let ino = self.inodes.lock().unwrap().ino_for(target);
                     reply.entry(&TTL, &attr_from_metadata(ino, &meta), Generation(0));
+                }
+                Err(e) => reply.error(e.into()),
+            },
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
+    // Gated on the new link's path, like `create`/`mkdir`: the link itself
+    // is a new name appearing in the vault. `link_target` is stored
+    // verbatim (it may be relative, absolute, or dangling - the kernel
+    // resolves it later, and any `open` of it comes back through this gate).
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        link_target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let Some(parent_path) = self.path_of(parent) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let link_path = parent_path.join(link_name);
+        if is_protected(&link_path) || !self.authorize(req, &link_path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
+        match std::os::unix::fs::symlink(link_target, &link_path) {
+            Ok(()) => match fs::symlink_metadata(&link_path) {
+                Ok(meta) => {
+                    let ino = self.inodes.lock().unwrap().ino_for(link_path);
+                    reply.entry(&TTL, &attr_from_metadata(ino, &meta), Generation(0));
+                }
+                Err(e) => reply.error(e.into()),
+            },
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
+    // Hard link: a second name for an existing inode. Gated on the source
+    // path (the content being aliased), matching how `rename` authorizes on
+    // its source.
+    fn link(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let (Some(src), Some(new_parent)) = (self.path_of(ino), self.path_of(newparent)) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let link_path = new_parent.join(newname);
+        if is_protected(&src) || is_protected(&link_path) || !self.authorize(req, &src) {
+            reply.error(Errno::EACCES);
+            return;
+        }
+        match fs::hard_link(&src, &link_path) {
+            Ok(()) => match fs::symlink_metadata(&link_path) {
+                Ok(meta) => {
+                    let new_ino = self.inodes.lock().unwrap().ino_for(link_path);
+                    reply.entry(&TTL, &attr_from_metadata(new_ino, &meta), Generation(0));
                 }
                 Err(e) => reply.error(e.into()),
             },

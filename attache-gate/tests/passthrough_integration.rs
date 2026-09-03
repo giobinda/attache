@@ -8,15 +8,19 @@
 //! flaky, and `cargo test` runs tests in a binary on separate threads by
 //! default, so each test takes out `MOUNT_LOCK` for its duration.
 
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use fuser::{Config, Session};
+use attache_gate::control;
 use attache_gate::passthrough_fs::PassthroughFs;
-use attache_gate::policy::{Prompter, PromptResponse};
+use attache_gate::policy::{ControlConfirm, Prompter, PromptResponse};
 use attache_gate::process_info::{ProcessIdentity, ProcResolver};
 
 static MOUNT_LOCK: Mutex<()> = Mutex::new(());
@@ -131,6 +135,163 @@ fn always_allow_round_trips_files_through_the_real_backing_directory() {
     assert!(!backing.path().join("hello.txt").exists());
 
     // dropping `_bg` here unmounts (BackgroundSession's Drop impl)
+}
+
+#[test]
+fn statfs_reports_the_backing_filesystems_real_free_space() {
+    // Regression: `fuser`'s default statfs replies with zero blocks free,
+    // so KDE's KIO copy job (which checks destination free space against
+    // the source size before it writes anything) refused every folder
+    // drag into the vault with "not enough space".
+    let _guard = MOUNT_LOCK.lock().unwrap();
+    let backing = tempfile::tempdir().unwrap();
+    let mountpoint = tempfile::tempdir().unwrap();
+
+    let fs = PassthroughFs::new(backing.path().to_path_buf(), AlwaysAllow, ProcResolver);
+    let session = Session::new(fs, mountpoint.path(), &Config::default()).unwrap();
+    let _bg = session.spawn().unwrap();
+    settle();
+
+    let c_path = std::ffi::CString::new(mountpoint.path().as_os_str().as_bytes()).unwrap();
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::statvfs(c_path.as_ptr(), &mut st) }, 0);
+
+    assert!(st.f_blocks > 0, "total blocks should be non-zero");
+    assert!(st.f_bavail > 0, "blocks available to us should be non-zero");
+    assert!(st.f_bsize > 0, "block size should be non-zero");
+}
+
+#[test]
+fn always_allow_supports_symlinks_and_hard_links() {
+    // Regression: the gate never implemented readlink/symlink/link, so
+    // every symlink in the vault was unreadable and creating one (or a
+    // hard link) failed with EPERM - which breaks recursive copies of a
+    // tree that contains links, git checkouts, and editors that
+    // canonicalize paths.
+    let _guard = MOUNT_LOCK.lock().unwrap();
+    let backing = tempfile::tempdir().unwrap();
+    let mountpoint = tempfile::tempdir().unwrap();
+
+    let fs = PassthroughFs::new(backing.path().to_path_buf(), AlwaysAllow, ProcResolver);
+    let session = Session::new(fs, mountpoint.path(), &Config::default()).unwrap();
+    let _bg = session.spawn().unwrap();
+    settle();
+
+    std::fs::write(mountpoint.path().join("target.txt"), b"payload").unwrap();
+
+    // create a symlink through the mount, read it back, and follow it
+    let link = mountpoint.path().join("link.txt");
+    std::os::unix::fs::symlink("target.txt", &link).unwrap();
+    assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("target.txt"));
+    assert_eq!(std::fs::read_to_string(&link).unwrap(), "payload");
+
+    // it landed in the backing dir as a real symlink
+    let backing_link = backing.path().join("link.txt");
+    assert!(std::fs::symlink_metadata(&backing_link).unwrap().is_symlink());
+
+    // a relative symlink whose target does not exist still resolves as a
+    // string (what realpath/canonicalize walks)
+    let dangling = mountpoint.path().join("dangling");
+    std::os::unix::fs::symlink("nowhere", &dangling).unwrap();
+    assert_eq!(std::fs::read_link(&dangling).unwrap(), Path::new("nowhere"));
+
+    // hard link: a second name for the same content
+    let hard = mountpoint.path().join("hard.txt");
+    std::fs::hard_link(mountpoint.path().join("target.txt"), &hard).unwrap();
+    assert_eq!(std::fs::read_to_string(&hard).unwrap(), "payload");
+    // the backing file and its new link share one inode (nlink == 2)
+    assert_eq!(
+        std::fs::metadata(backing.path().join("target.txt")).unwrap().nlink(),
+        2
+    );
+    assert_eq!(
+        std::fs::metadata(backing.path().join("target.txt")).unwrap().ino(),
+        std::fs::metadata(backing.path().join("hard.txt")).unwrap().ino()
+    );
+}
+
+#[test]
+fn always_deny_blocks_symlink_creation() {
+    let _guard = MOUNT_LOCK.lock().unwrap();
+    let backing = tempfile::tempdir().unwrap();
+    let mountpoint = tempfile::tempdir().unwrap();
+
+    let fs = PassthroughFs::new(backing.path().to_path_buf(), AlwaysDeny, ProcResolver);
+    let session = Session::new(fs, mountpoint.path(), &Config::default()).unwrap();
+    let _bg = session.spawn().unwrap();
+    settle();
+
+    let err = std::os::unix::fs::symlink("target", mountpoint.path().join("link")).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+struct NeverConfirm;
+impl ControlConfirm for NeverConfirm {
+    fn confirm(&self, _action: &str) -> bool {
+        false
+    }
+}
+
+/// One `STATUS\n` round-trip on the control socket, returning the trimmed
+/// `OK <idle-seconds> <open-handles>` reply parsed into its two numbers.
+fn control_status(socket: &Path) -> (u64, u64) {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream.write_all(b"STATUS\n").unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    let resp = resp.trim();
+    let mut it = resp.split_whitespace();
+    assert_eq!(it.next(), Some("OK"), "unexpected STATUS reply: {resp:?}");
+    let idle = it.next().and_then(|s| s.parse().ok()).unwrap();
+    let handles = it.next().and_then(|s| s.parse().ok()).unwrap();
+    (idle, handles)
+}
+
+#[test]
+fn control_status_tracks_vault_activity_for_the_idle_timeout() {
+    // Regression: `att`'s idle-timeout manager sampled `lsof +D` + mtime
+    // from outside the mount and tore the vault down mid-playlist whenever
+    // a media player had buffered the current track and closed its fd. The
+    // gate now reports "seconds since last read/write/open" and "open
+    // handle count" over the control socket, so a recent read still counts
+    // as activity and an editor holding a file open is never "idle".
+    let _guard = MOUNT_LOCK.lock().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let backing = state.path().join("decrypted");
+    std::fs::create_dir(&backing).unwrap();
+    let mountpoint = tempfile::tempdir().unwrap();
+
+    let fs = PassthroughFs::new(backing.clone(), AlwaysAllow, ProcResolver);
+    control::spawn(
+        state.path().to_path_buf(),
+        fs.whitelist_handle(),
+        fs.activity_monitor(),
+        NeverConfirm,
+    );
+    let session = Session::new(fs, mountpoint.path(), &Config::default()).unwrap();
+    let _bg = session.spawn().unwrap();
+    settle();
+
+    let socket = state.path().join("control.sock");
+    let song = mountpoint.path().join("song.flac");
+    std::fs::write(&song, b"audio payload").unwrap();
+
+    // A file held open is activity regardless of how long ago the last
+    // byte moved - this is the case the old `lsof` check got right and the
+    // one a purely time-based check would miss.
+    let held = std::fs::File::open(&song).unwrap();
+    let (_, handles) = control_status(&socket);
+    assert!(handles >= 1, "an open handle must be counted, got {handles}");
+    drop(held);
+    settle();
+
+    // A fresh read bumps last-activity even though no handle stays open
+    // afterward - the streaming-media case.
+    let _ = std::fs::read(&song).unwrap();
+    settle();
+    let (idle, handles) = control_status(&socket);
+    assert_eq!(handles, 0, "no handle should be open now, got {handles}");
+    assert!(idle <= 3, "a read moments ago should read as active, got {idle}s");
 }
 
 #[test]
