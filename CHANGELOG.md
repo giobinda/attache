@@ -2,6 +2,26 @@
 
 All notable changes are recorded here. Every bug fix ships as a new release.
 
+## Unreleased
+
+### Added
+- **Duress password** (`att duress`). Typed at `att open`, it silently
+  destroys the vault as `att oblivion` does, then opens a new, empty vault
+  keyed to that password, so under coercion the vault appears to open
+  normally. Hashed with argon2id via the new `attache-gate duress-set` /
+  `duress-check` subcommands (password on stdin, never argv). The real
+  password is always tried first, so it can never trigger destruction.
+
+### Fixed
+- **`att oblivion` could abort before shredding the key.** `gocryptfs.conf`
+  is mode 0400 and `shred` was run without `-f`, so it failed with
+  "Permission denied" and `set -e` stopped the script there. It now forces
+  write permission before overwriting, and reports failure if the key
+  file survived instead of claiming success.
+- **`att oblivion` destroyed nothing if `~/.attache` was a symlink** (e.g.
+  to a vault on another disk): `find` didn't descend into it and `rm -rf`
+  removed only the link. The path is now resolved first.
+
 ## v0.1.5
 
 ### Fixed

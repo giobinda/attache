@@ -58,6 +58,11 @@ GATE_LOGFILE="$STATE_DIR/gate.log"
 STAMPFILE="$STATE_DIR/last_active"
 PWFIFO="$STATE_DIR/open.pwfifo"
 CONTROL_SOCKET="$STATE_DIR/control.sock"  # kept in sync with SOCKET_NAME in attache-gate/src/control.rs
+# Outside $CIPHERDIR on purpose: gocryptfs logs every unrecognised name in
+# the cipherdir root to the system journal ("could not decrypt entry ...")
+# on each listing, which would leave a permanent record that a duress
+# password exists. Consequence: it is not part of `att export`.
+DURESS_FILE="$STATE_DIR/duress"
 CHECK_INTERVAL_MIN=5   # how often to check, and the inactivity window
 
 # Only setting here is MOUNTPOINT, the display name symlinked to
@@ -66,6 +71,10 @@ CHECK_INTERVAL_MIN=5   # how often to check, and the inactivity window
 # ever reaches a privileged operation.
 CONFIG_FILE="$HOME/.config/attache/config"
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+# Internal hand-off between functions (see duress_open/cmd_duress); never
+# honoured from the environment, or exporting it would silently skip the
+# password prompt.
+unset PRESET_PASSWORD
 : "${MOUNTPOINT:=$HOME/attache}"
 
 # Binaries bundled onto an exported disc so a fresh machine needs nothing
@@ -351,25 +360,22 @@ open_attache() {
     # Password prompt runs here, on this interactive shell's real
     # terminal - the manager is already backgrounded and can't offer one.
     # Handed to gocryptfs (inside the manager, via attache-mount-helper)
-    # through $PWFIFO, opened read-write so this write can never block
-    # waiting for a reader: if the manager errors out before ever reading
-    # it, the password just sits in the pipe buffer and gets discarded
-    # with the fifo below, while the poll loop's timeout reports the
-    # failure. Never touches argv or an env var, so it's not visible to
-    # other processes via /proc/<pid>/cmdline or /proc/<pid>/environ.
+    # through $PWFIFO by feed_password.
     local password
-    if ! read -r -s -p "Attache password: " password; then
+    if [[ -n "${PRESET_PASSWORD:-}" ]]; then
+        password="$PRESET_PASSWORD"
+        unset PRESET_PASSWORD
+    elif ! read -r -s -p "Attache password: " password; then
         echo >&2
         echo "att: no password entered" >&2
         kill "$(cat "$MANAGER_PIDFILE")" 2>/dev/null || true
         rm -f "$MANAGER_PIDFILE" "$PWFIFO"
         return 1
+    else
+        echo
     fi
-    echo
-    exec 9<>"$PWFIFO"
-    printf '%s\n' "$password" >&9
-    exec 9>&-
-    unset password
+
+    feed_password "$password" || true
 
     # The password is already sent by this point, so this is only waiting
     # on the actual mount (normally well under a second) - generous
@@ -377,15 +383,44 @@ open_attache() {
     # human-typing-inclusive) budget into reporting "failed" prematurely.
     for _ in $(seq 1 100); do
         if is_mounted; then
+            unset password
             echo "att: open at $MOUNTPOINT (auto-closes after ${CHECK_INTERVAL_MIN}m idle, at logout/shutdown, or before suspend; access prompts via GUI dialog)"
             return 0
         fi
         manager_running || break
         sleep 0.1
     done
-    echo "att: failed to open, see $LOGFILE and $GATE_LOGFILE" >&2
+    if manager_running; then
+        kill -TERM "$(cat "$MANAGER_PIDFILE")" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            manager_running || break
+            sleep 0.1
+        done
+    fi
     rm -f "$MANAGER_PIDFILE" "$PWFIFO"
+
+    # Only once the password has failed to unlock the real vault: a real
+    # password can then never trigger destruction, whatever the duress
+    # file says (tampered with, or the real password later changed to
+    # match it).
+    if is_duress_password "$password"; then
+        duress_open "$password"
+        return $?
+    fi
+    unset password
+    echo "att: failed to open, see $LOGFILE and $GATE_LOGFILE" >&2
     return 1
+}
+
+# Writes $1 to $PWFIFO for gocryptfs's -passfile. Opening a FIFO write-only
+# blocks until the reader has it open, which is the point: written through a
+# read-write fd and closed before gocryptfs gets there, the password would
+# be silently discarded and gocryptfs would wait forever. A human typing
+# always gave the reader that head start; PRESET_PASSWORD does not. The
+# timeout covers a reader that never comes (helper died). printf is a
+# builtin, so the password never appears in any argv or environ.
+feed_password() {
+    printf '%s\n' "$1" | timeout 30 sh -c 'cat >"$1"' _ "$PWFIFO" 2>/dev/null
 }
 
 close_attache() {
@@ -539,8 +574,9 @@ cmd_export() {
 
     cat >"$stage/README.txt" <<'EOF'
 This disc contains an Attache-encrypted vault (gocryptfs) plus everything
-needed to restore it on a fresh Linux machine (any distro, x86_64) with
-nothing preinstalled beyond a kernel with FUSE support.
+needed to restore it on a fresh Linux machine (any distro, same CPU
+architecture as the machine that wrote it) with nothing preinstalled beyond
+a kernel with FUSE support.
 
 To restore, from a terminal with this disc mounted:
 
@@ -581,10 +617,74 @@ EOF
     echo "  wodim -v dev=/dev/sr0 $iso     # alternative"
 }
 
-# Permanently destroys the vault. Two-step: first overwrite the gocryptfs
-# key/IV files with random data (so even recovered ciphertext should be
-# undecryptable), then delete the encrypted payload outright. No flag
-# skips the two "yes" confirmations - this is irreversible.
+# The irreversible part of oblivion, shared with the duress path. First
+# overwrites gocryptfs.conf - the wrapped master key, the only secret on
+# disk - and the duress hash with random data, so even recovered ciphertext
+# should be undecryptable, then deletes the encrypted payload outright.
+# $1 = "verbose" or "quiet": the duress path must print nothing, since
+# someone may be watching the terminal. Keeps going past individual
+# failures rather than stopping halfway; returns 1 if the key file survived.
+#
+# Resolves $CIPHERDIR first: if ~/.attache is a symlink to another disk,
+# `find` (no -L) wouldn't descend into it and `rm -rf` would only remove the
+# link, leaving the key and the payload untouched.
+destroy_vault() {
+    local v=-v out=/dev/stdout cdir
+    if [[ "$1" == quiet ]]; then
+        v=""
+        out=/dev/null
+    fi
+    cdir="$(readlink -f "$CIPHERDIR")"
+
+    echo "att: overwriting key material with random data..." >"$out"
+    # gocryptfs.conf* also catches any .tmp/.bak copy left by a password change.
+    find "$cdir" -maxdepth 1 -name 'gocryptfs.conf*' -type f -print0 2>/dev/null |
+        xargs -0 -r shred -f -n 3 -u $v >"$out" 2>&1 || true
+    [[ -f "$DURESS_FILE" ]] && { shred -f -n 3 -u $v "$DURESS_FILE" >"$out" 2>&1 || true; }
+    if [[ "$1" != quiet ]]; then
+        # Per-directory IVs aren't secret, so the duress path skips them to
+        # stay fast; oblivion keeps its old thoroughness.
+        find "$cdir" -name gocryptfs.diriv -type f -print0 2>/dev/null |
+            xargs -0 -r shred -f -n 3 -u $v >"$out" 2>&1 || true
+    fi
+
+    # gate.log/manager.log record real attache file paths (FUSE trace output,
+    # access-prompt targets, ...) in plain text outside the encrypted
+    # payload - "no recoverable trace" has to mean these too, not just the
+    # ciphertext, or oblivion leaves exactly the kind of record it exists
+    # to destroy.
+    echo "att: shredding logs..." >"$out"
+    find "$STATE_DIR" -maxdepth 1 -name '*.log' -type f -print0 2>/dev/null |
+        xargs -0 -r shred -f -n 3 -u $v >"$out" 2>&1 || true
+
+    echo "att: deleting encrypted payload..." >"$out"
+    local graveyard=""
+    if [[ "$1" == quiet ]]; then
+        # The key is already gone, so the payload is unreadable noise from
+        # here on; deleting a large vault can take a while, which would make
+        # the "open" visibly slower than usual. Move it aside (a sibling, so
+        # same filesystem and instant) and delete it in the background.
+        graveyard="$(mktemp -d "$(dirname "$cdir")/.cache-XXXXXXXX" 2>/dev/null)" || graveyard=""
+    fi
+    if [[ -n "$graveyard" ]] && mv "$cdir" "$graveyard/" 2>/dev/null; then
+        setsid rm -rf "$graveyard" </dev/null >/dev/null 2>&1 &
+    else
+        [[ -n "$graveyard" ]] && rmdir "$graveyard" 2>/dev/null
+        rm -rf "$cdir" 2>"$out" || true
+    fi
+    [[ -L "$CIPHERDIR" && "$1" != quiet ]] && rm -f "$CIPHERDIR"
+    rm -rf "$STATE_DIR" "$REAL_MOUNTPOINT" 2>/dev/null || true
+    # $MOUNTPOINT is just a symlink onto REAL_MOUNTPOINT (unless someone
+    # pointed it at REAL_MOUNTPOINT itself, already removed above) - `rm
+    # -f`, not `-rf`, since it must never follow the link and touch
+    # whatever it points at.
+    [[ "$MOUNTPOINT" != "$REAL_MOUNTPOINT" ]] && rm -f "$MOUNTPOINT" 2>/dev/null || true
+
+    [[ ! -e "$cdir/gocryptfs.conf" ]]
+}
+
+# Permanently destroys the vault. No flag skips the two "yes"
+# confirmations - this is irreversible.
 cmd_oblivion() {
     if is_mounted; then
         echo "att: run 'att close' first" >&2
@@ -609,29 +709,118 @@ cmd_oblivion() {
     read -r -p "Really destroy it? Type yes again: " confirm2 || true
     [[ "$confirm2" == "yes" ]] || { echo "att: aborted, nothing was touched"; exit 1; }
 
-    echo "att: overwriting key material with random data..."
-    find "$CIPHERDIR" \( -name gocryptfs.conf -o -name gocryptfs.diriv \) -type f -print0 |
-        xargs -0 -r shred -n 3 -u -v
-
-    # gate.log/manager.log record real attache file paths (FUSE trace output,
-    # access-prompt targets, ...) in plain text outside the encrypted
-    # payload - "no recoverable trace" has to mean these too, not just the
-    # ciphertext, or oblivion leaves exactly the kind of record it exists
-    # to destroy.
-    echo "att: shredding logs..."
-    find "$STATE_DIR" -maxdepth 1 -name '*.log' -type f -print0 |
-        xargs -0 -r shred -n 3 -u -v
-
-    echo "att: deleting encrypted payload..."
-    rm -rf "$CIPHERDIR"
-    rm -rf "$STATE_DIR" "$REAL_MOUNTPOINT" 2>/dev/null || true
-    # $MOUNTPOINT is just a symlink onto REAL_MOUNTPOINT (unless someone
-    # pointed it at REAL_MOUNTPOINT itself, already removed above) - `rm
-    # -f`, not `-rf`, since it must never follow the link and touch
-    # whatever it points at.
-    [[ "$MOUNTPOINT" != "$REAL_MOUNTPOINT" ]] && rm -f "$MOUNTPOINT" 2>/dev/null || true
-
+    if ! destroy_vault verbose; then
+        echo "att: oblivion FAILED: $(readlink -f "$CIPHERDIR")/gocryptfs.conf still exists" >&2
+        exit 1
+    fi
     echo "att: oblivion complete, $CIPHERDIR no longer exists."
+}
+
+# Duress password: a second password that, typed at `att open`, silently
+# runs oblivion and then opens a brand-new, empty vault keyed to that same
+# password - so under coercion the vault appears to open normally, and the
+# password just handed over keeps "working" afterwards. The hash lives in
+# $DURESS_FILE (argon2id, see attache-gate/src/duress.rs); the check runs
+# via `attache-gate duress-check`, password on stdin (printf is a builtin,
+# so it never appears in any argv).
+is_duress_password() {
+    [[ -f "$DURESS_FILE" ]] || return 1
+    printf '%s\n' "$1" | attache-gate duress-check "$DURESS_FILE" 2>/dev/null
+}
+
+# Called from open_attache once the password has failed to unlock the real
+# vault (so the manager is already gone) and matched the duress hash.
+# Destroys the vault, creates the decoy, then re-enters open_attache to
+# mount the decoy like any other open. Ctrl-C/hangup are ignored until the
+# decoy exists, so the destruction can't be interrupted halfway.
+duress_open() {
+    local password="$1" cdir
+    cdir="$(readlink -f "$CIPHERDIR")"
+    trap '' INT TERM HUP
+
+    destroy_vault quiet || true
+
+    mkdir -p "$STATE_DIR" "$cdir" 2>/dev/null
+    chmod 700 "$STATE_DIR" "$cdir" 2>/dev/null
+    if ! printf '%s\n' "$password" | gocryptfs -q -init -passfile /dev/stdin "$cdir" >/dev/null 2>&1; then
+        trap - INT TERM HUP
+        # The real vault is already gone; failing here at least looks like
+        # an ordinary failed open.
+        echo "att: failed to open, see $LOGFILE and $GATE_LOGFILE" >&2
+        return 1
+    fi
+    trap - INT TERM HUP
+    PRESET_PASSWORD="$password"
+    open_attache
+}
+
+# Sets (or with --remove, clears) the duress password. Asks for the real
+# password too and checks it by unlocking the vault in the isolated
+# namespace: that proves the vault is yours, and lets us refuse a duress
+# password equal to the real one, which would destroy the vault on the
+# very next open.
+cmd_duress() {
+    case "${1:-}" in
+        --remove)
+            if [[ ! -f "$DURESS_FILE" ]]; then
+                echo "att: no duress password is set"
+                return 0
+            fi
+            shred -f -n 3 -u "$DURESS_FILE"
+            echo "att: duress password removed"
+            return 0
+            ;;
+        "") ;;
+        *) echo "att: usage: att duress [--remove]" >&2; exit 1 ;;
+    esac
+    if [[ ! -d "$CIPHERDIR" ]]; then
+        echo "att: no vault at $CIPHERDIR - run 'att init' first" >&2
+        exit 1
+    fi
+
+    echo "Typing the duress password at 'att open' will silently and PERMANENTLY"
+    echo "destroy this vault, then open an empty one in its place."
+    local real duress duress2
+    read -r -s -p "Real Attache password: " real || { echo >&2; exit 1; }
+    echo
+    read -r -s -p "Duress password: " duress || { echo >&2; exit 1; }
+    echo
+    read -r -s -p "Duress password again: " duress2 || { echo >&2; exit 1; }
+    echo
+    if [[ "$duress" != "$duress2" ]]; then
+        echo "att: duress passwords do not match" >&2
+        exit 1
+    fi
+    if [[ -z "$duress" ]]; then
+        echo "att: duress password must not be empty" >&2
+        exit 1
+    fi
+    if [[ "$duress" == "$real" ]]; then
+        echo "att: duress password must differ from the real password" >&2
+        exit 1
+    fi
+    unset duress2
+
+    PRESET_PASSWORD="$real"
+    unset real
+    if ! run_helper_with_password list-whitelist >/dev/null; then
+        echo "att: wrong real password, duress password not set" >&2
+        exit 1
+    fi
+
+    if ! printf '%s\n' "$duress" | attache-gate duress-set "$DURESS_FILE"; then
+        echo "att: failed to save the duress password" >&2
+        exit 1
+    fi
+    # Self-test with the very binary `att open` will use, so an outdated
+    # attache-gate can't leave a duress password that silently never fires.
+    if ! is_duress_password "$duress"; then
+        shred -f -n 3 -u "$DURESS_FILE" 2>/dev/null || true
+        echo "att: duress self-test failed (outdated attache-gate?), not set" >&2
+        exit 1
+    fi
+    unset duress
+    echo "att: duress password set"
 }
 
 # Runs `attache-mount-helper <args...>` with the vault closed, feeding it
@@ -662,17 +851,19 @@ run_helper_with_password() {
     local helper_pid=$!
 
     local password
-    if ! read -r -s -p "Attache password: " password; then
+    if [[ -n "${PRESET_PASSWORD:-}" ]]; then
+        password="$PRESET_PASSWORD"
+        unset PRESET_PASSWORD
+    elif ! read -r -s -p "Attache password: " password; then
         echo >&2
         echo "att: no password entered" >&2
         kill "$helper_pid" 2>/dev/null || true
         rm -f "$PWFIFO"
         return 1
+    else
+        echo
     fi
-    echo
-    exec 9<>"$PWFIFO"
-    printf '%s\n' "$password" >&9
-    exec 9>&-
+    feed_password "$password" || true
     unset password
 
     wait "$helper_pid"
@@ -873,6 +1064,11 @@ Usage: att <command> [args]
                           logs, then delete the encrypted payload. Two
                           typed confirmations required. No undo, and no
                           backup unless you made one yourself.
+  duress [--remove]       Set (or remove) a duress password. Typed at
+                          'att open', it silently destroys the vault as
+                          'oblivion' would, then opens a new, empty vault
+                          with that password, as if nothing happened.
+                          Asks for the real password first.
   allow --always <path>   Pre-approve a binary for always-allowed Attache
                           access without waiting for a live prompt. Works
                           whether Attache is currently open or closed.
@@ -906,13 +1102,14 @@ case "${1:-}" in
     note)      shift; cmd_note "$@" ;;
     export)    shift; cmd_export "$@" ;;
     oblivion)  cmd_oblivion ;;
+    duress)    shift; cmd_duress "$@" ;;
     reset-whitelist) shift; cmd_reset_whitelist "$@" ;;
     allow)     shift; cmd_allow "$@" ;;
     denied)    cmd_denied ;;
     help|--help|-h) cmd_help ;;
     __manager) cmd_manager ;;
     *)
-        echo "Usage: att {init|open|close|status|note|export|oblivion|allow|reset-whitelist|denied}" >&2
+        echo "Usage: att {init|open|close|status|note|export|oblivion|duress|allow|reset-whitelist|denied}" >&2
         echo "Run 'att help' for details." >&2
         exit 1
         ;;

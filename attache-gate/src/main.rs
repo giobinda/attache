@@ -10,6 +10,16 @@ fn main() -> ExitCode {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+    // Duress-password helpers for `att` (see duress.rs). They live in this
+    // binary rather than a new one so an exported disc needs nothing extra
+    // to honour the duress password on a fresh machine. The password comes
+    // in on stdin, never argv.
+    match args.get(1).map(String::as_str) {
+        Some("duress-set") | Some("duress-check") if args.len() == 3 => {
+            return run_duress(&args[1], std::path::Path::new(&args[2]));
+        }
+        _ => {}
+    }
     let Some((backing, mountpoint)) = parse_args(&args) else {
         eprintln!(
             "Usage: {} <backing-dir> <mountpoint>",
@@ -110,6 +120,37 @@ fn main() -> ExitCode {
         Err(e) => eprintln!("warning: failed to run fusermount -u {}: {e}", backing.display()),
     }
     ExitCode::SUCCESS
+}
+
+/// `duress-set <file>`: hash the password on stdin into <file>.
+/// `duress-check <file>`: exit 0 if the password on stdin is the duress
+/// password, 1 if it isn't (including no/corrupt file), 2 on a read error.
+fn run_duress(cmd: &str, file: &std::path::Path) -> ExitCode {
+    let password = match attache_gate::duress::read_password_line() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: reading password from stdin: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if cmd == "duress-set" {
+        if password.is_empty() {
+            eprintln!("error: empty duress password");
+            return ExitCode::from(2);
+        }
+        return match attache_gate::duress::set(file, &password) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: writing {}: {e}", file.display());
+                ExitCode::from(2)
+            }
+        };
+    }
+    if attache_gate::duress::matches(file, &password) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 fn parse_args(args: &[String]) -> Option<(PathBuf, PathBuf)> {

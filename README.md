@@ -13,9 +13,11 @@ prompt (over SSH, headless), unapproved access is denied by default.
 The vault auto-closes after 5 minutes idle, at logout or shutdown, and before
 suspend.
 
-> **Status:** early, single-author project. It performs privileged mount
-> operations — read the code and the [threat model](#threat-model) before
-> trusting it with anything that matters.
+> **Status:** early, single-author project, not independently audited. It
+> performs privileged mount operations — read the code and the
+> [threat model](#threat-model) before trusting it with anything that matters.
+> **If your safety depends on it, read [If you are at risk](#if-you-are-at-risk)
+> first.**
 
 ## Quick start
 
@@ -61,7 +63,7 @@ in advance.
 
 | Path | What it is |
 | --- | --- |
-| `att` | Bash CLI — `init`, `open`, `close`, `status`, `note`, `export`, `allow`, `reset-whitelist`, `denied`, `oblivion`. Owns the background manager process that holds the mounts open and tears them down on idle/logout/suspend. |
+| `att` | Bash CLI — `init`, `open`, `close`, `status`, `note`, `export`, `allow`, `reset-whitelist`, `denied`, `oblivion`, `duress`. Owns the background manager process that holds the mounts open and tears them down on idle/logout/suspend. |
 | `attache-gate/` | Rust crate. Builds **`attache-gate`** (the FUSE passthrough that does the per-binary gating) and **`attache-mount-helper`** (the one privileged helper, `cap_sys_admin`, that sets up the mount namespace). |
 | `attache-import/` | Rust crate. **`attache-import`** — restores a vault from an exported disc onto a fresh machine, verifying every file against a burned-in `MANIFEST.sha256` first. |
 
@@ -109,6 +111,123 @@ outside.
   yourself with `att export`. `att oblivion` — which shreds the key material and
   deletes the payload — is genuinely irreversible.
 
+## Duress password
+
+`att duress` sets a second password (it asks for the real one first, and
+refuses a duress password equal to it). At `att open`, the password is always
+tried against the real vault first, so the real password can never trigger
+destruction. Only if that fails *and* the password matches the duress hash
+does `att`:
+
+1. silently do what `att oblivion` does — shred `gocryptfs.conf`, the logs and
+   the duress hash, then delete the payload (in the background, so the open
+   isn't much slower). Ctrl-C is ignored until this is done;
+2. create a new, empty vault keyed to the duress password and open it.
+
+The terminal shows exactly what a normal open shows, and the password you
+handed over keeps "working" afterwards. `att duress --remove` disarms it.
+
+The hash (argon2id) lives at `~/.local/state/attache/duress`, **not** in
+`~/.attache`: gocryptfs writes every unrecognised file name in the cipherdir
+to the system journal. So it is not included in `att export`; run
+`att duress` again after restoring a vault.
+
+What it does **not** protect against:
+
+- **A copy taken first.** Anyone who imaged the disk or holds an `att export`
+  disc still has the real vault; the duress password only destroys this copy.
+- **Disk forensics on SSD / copy-on-write filesystems** (btrfs, the Fedora
+  default). `shred` cannot overwrite in place there; the old `gocryptfs.conf`
+  can survive in unallocated blocks. See
+  [Secure deletion is not guaranteed](#secure-deletion-is-not-guaranteed).
+- **Noticing the feature.** The hash file exists in plain sight, `att duress`
+  may be in your shell history, and a duress open takes about 1s longer than a
+  normal one. The decoy is visibly brand new (timestamps, empty whitelist).
+- **Other commands.** Only `att open` (and `att note`, which opens through it)
+  checks the duress password. `allow`, `reset-whitelist` and the rest just
+  report a wrong password.
+- **Malware running as you.** It could read the real password as you type it;
+  nothing in this tool defends against that.
+
+## If you are at risk
+
+Attaché was written with people in mind who may be forced to hand over their
+devices or passwords: activists, journalists, and people living under
+authoritarian governments or with an abusive partner. If that is you, these are
+the limits you need to know about. No tool makes you safe on its own. Read
+this whole section before relying on it.
+
+### Encrypt the whole disk first
+
+Attaché protects the files *inside* the vault. Copies of what you work on
+leak into the rest of the system, where Attaché cannot reach:
+
+- **swap and hibernation images** (RAM written to disk, including open files);
+- **thumbnails** (`~/.cache/thumbnails`), **"recent files"** lists
+  (`~/.local/share/recently-used.xbel`), and editor backup or autosave files;
+- **desktop search indexers** (KDE Baloo, GNOME Tracker), which copy file
+  *contents* into their own databases. When the access dialog asks about
+  `baloo_file`, `tracker-miner-fs` or a thumbnailer, choose **Deny**, never
+  Always Allow;
+- **clipboard history** (Klipper and similar);
+- **system logs** (`journalctl`), which record when vaults were mounted.
+
+**Full-disk encryption (LUKS), with swap on the encrypted disk, is the
+baseline.** Most installers offer it as a checkbox. Attaché sits on top of it,
+it does not replace it. Full-disk encryption only protects a machine that is
+powered **off**, so shut down rather than suspend when there's a risk of
+seizure.
+
+### Secure deletion is not guaranteed
+
+`att oblivion` and the duress password overwrite the vault's key file
+(`gocryptfs.conf`, the only secret on disk) and then delete everything. On
+modern storage, "overwrite" cannot be guaranteed:
+
+- **SSDs and flash** remap writes internally, so the old blocks can remain
+  readable by forensic tools until the drive's garbage collection erases them.
+- **btrfs** (the default on Fedora and derivatives) and other copy-on-write
+  filesystems write the "overwrite" to a new location, leaving the original
+  untouched. Compression makes this worse.
+- **Snapshots and backups** (Timeshift, Snapper, btrfs snapshots, cloud sync of
+  your home folder) keep their own copy of the key file and the vault. Exclude
+  `~/.attache` from all of them, or the copy outlives `oblivion`.
+
+What this means in practice: a recovered key file is still locked by your
+**real password**. An adversary with forensic tools *and* that file would then
+pressure you for that password. Full-disk encryption closes most of this gap:
+with the disk encrypted, leftover blocks are themselves unreadable once the
+machine is off. On btrfs, also run `chattr +C ~/.attache` on the empty
+directory *before* `att init`, so the key file is overwritten in place, and keep
+TRIM enabled (the `discard` mount option or `fstrim.timer`).
+
+### About the duress password
+
+- **It is not deniable.** The `att` tool, `~/.attache` and its `gocryptfs.conf`
+  plainly show that an encrypted vault exists. After a duress open, the vault
+  is empty and freshly created. An adversary who expected to find something
+  may not believe it.
+- **Destroying data can make things worse.** In many countries, destroying
+  data that is wanted as evidence is a crime in its own right, sometimes
+  punished more heavily than what the data contained. An adversary who
+  realises you wiped something may react with more force. Only you can weigh
+  this. Decide calmly in advance, not under pressure.
+- **It only destroys this copy.** Exports, backups, synced copies, or a disk
+  image the adversary already took are untouched.
+- **Practise first** on a throwaway vault, so you know exactly what it looks
+  like and how long it takes.
+
+### Operational habits
+
+- Run `att close` when you finish. Don't rely on the 5-minute idle timeout.
+- Don't leave the machine suspended or unlocked where it could be taken.
+- Keep commands like `att duress` out of your shell history (with
+  `HISTCONTROL=ignorespace`, start the command with a space).
+- Install from verified releases (check `SHA256SUMS`) or build from source, and
+  keep the tool updated.
+- If someone may already have installed spyware on your computer, no
+  encryption tool helps: they can read your password as you type it.
+
 ## Threat model
 
 A plain directory's permission bits cannot tell "attache-gate" apart from any
@@ -141,6 +260,10 @@ for `att export`.
 curl -fsSL https://raw.githubusercontent.com/giobinda/attache/main/bootstrap.sh | bash
 ```
 
+Prebuilt binaries are published for **x86_64** (Intel/AMD) and **aarch64**
+(64-bit ARM: Raspberry Pi 4/5, ARM laptops and servers).
+`bootstrap.sh` picks the right one for your machine.
+
 `bootstrap.sh` downloads the static musl binaries (`att`,
 `attache-gate`, `attache-mount-helper`, `attache-import`) from the latest GitHub
 release, verifies them against the release's `SHA256SUMS`, and installs them into
@@ -171,8 +294,8 @@ sudo ./install-mount-helper.sh      # the one privileged step — never run auto
 ```
 
 Source builds also need a musl-capable Rust toolchain (`rustup target add
-x86_64-unknown-linux-musl`). The `bash` one-liner keeps the checkout at
-`~/.local/share/attache/src`; re-running it updates and rebuilds in place.
+x86_64-unknown-linux-musl`, or `aarch64-unknown-linux-musl` on ARM). The
+`bash` one-liner keeps the checkout at `~/.local/share/attache/src`; re-running it updates and rebuilds in place.
 
 ### Then
 
@@ -194,7 +317,7 @@ binary's contents drops the file capability by kernel design.
 ## Development
 
 ```sh
-cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
 cargo test          # unit tests + the passthrough / import integration tests
 ```
 
