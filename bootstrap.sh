@@ -3,8 +3,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/giobinda/attache/main/bootstrap.sh | bash
 #
-# Default (ATTACHE_BUILD=prebuilt): downloads the static musl binaries from a
-# GitHub release, verifies them against the release's SHA256SUMS, and installs
+# Default (ATTACHE_BUILD=prebuilt): downloads the static musl binaries for this
+# machine's architecture (x86_64 or aarch64) from a GitHub release, verifies them against the release's SHA256SUMS, and installs
 # them into ~/.local/bin. No toolchain needed.
 #
 # ATTACHE_BUILD=source: clones the repo to ~/.local/share/attache/src and runs
@@ -79,21 +79,50 @@ install_prebuilt() {
         tag="$ref"
     fi
 
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64)  arch=x86_64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        *) die "no prebuilt binaries for $(uname -m) - use ATTACHE_BUILD=source" ;;
+    esac
+
     local base="https://github.com/$SLUG/releases/download/$tag"
     _tmp="$(mktemp -d)"
 
-    echo "bootstrap: downloading $tag from $SLUG (prebuilt static musl)..."
-    local f
-    for f in "${BINS[@]}" att install-mount-helper.sh SHA256SUMS; do
+    curl -fsSL "$base/SHA256SUMS" -o "$_tmp/SHA256SUMS" \
+        || die "could not download SHA256SUMS from release $tag - does that release exist? (try ATTACHE_BUILD=source)"
+
+    # Releases up to v0.1.5 shipped x86_64 only, under unsuffixed names
+    # (attache-gate); later ones ship <bin>-linux-<arch> for each arch.
+    local suffix="-linux-$arch"
+    if ! grep -q "  attache-gate$suffix\$" "$_tmp/SHA256SUMS"; then
+        [[ "$arch" == x86_64 ]] || die "release $tag has no $arch binaries - pick a newer ATTACHE_REF or use ATTACHE_BUILD=source"
+        suffix=""
+    fi
+
+    echo "bootstrap: downloading $tag ($arch) from $SLUG (prebuilt static musl)..."
+    local f want=()
+    for f in "${BINS[@]}"; do want+=("$f$suffix"); done
+    want+=(att install-mount-helper.sh)
+    for f in "${want[@]}"; do
         curl -fsSL "$base/$f" -o "$_tmp/$f" \
-            || die "could not download $f from release $tag - does that release exist? (try ATTACHE_BUILD=source)"
+            || die "could not download $f from release $tag (try ATTACHE_BUILD=source)"
     done
 
+    # Check exactly the files we install, each of which must be listed:
+    # `sha256sum -c --ignore-missing` would pass a file that isn't in
+    # SHA256SUMS at all.
     echo "bootstrap: verifying checksums..."
-    ( cd "$_tmp" && sha256sum -c SHA256SUMS ) || die "checksum verification FAILED - aborting"
+    : >"$_tmp/WANTED"
+    for f in "${want[@]}"; do
+        grep -E "^[0-9a-f]{64}  $f\$" "$_tmp/SHA256SUMS" >>"$_tmp/WANTED" \
+            || die "$f is not listed in SHA256SUMS - aborting"
+    done
+    ( cd "$_tmp" && sha256sum -c WANTED ) || die "checksum verification FAILED - aborting"
 
     mkdir -p "$BIN_DIR" "$SHARE_DIR"
-    for f in "${BINS[@]}" att; do install -m 755 "$_tmp/$f" "$BIN_DIR/$f"; done
+    for f in "${BINS[@]}"; do install -m 755 "$_tmp/$f$suffix" "$BIN_DIR/$f"; done
+    install -m 755 "$_tmp/att" "$BIN_DIR/att"
     install -m 755 "$_tmp/install-mount-helper.sh" "$SHARE_DIR/install-mount-helper.sh"
 
     final_steps "$SHARE_DIR/install-mount-helper.sh"

@@ -15,7 +15,11 @@ set -euo pipefail
 # This script lives at the repo root, so SELF_DIR is REPO_ROOT.
 SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO_ROOT="$SELF_DIR"
-TARGET_TRIPLE="x86_64-unknown-linux-musl"
+case "$(uname -m)" in
+    x86_64|amd64)  TARGET_TRIPLE="x86_64-unknown-linux-musl" ;;
+    aarch64|arm64) TARGET_TRIPLE="aarch64-unknown-linux-musl" ;;
+    *) echo "install: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
 BIN_DIR="$HOME/.local/bin"
 
 missing=()

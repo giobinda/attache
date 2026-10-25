@@ -4,15 +4,27 @@ on:
   push:
     tags:
       - "v*"
+  # Manual runs build and smoke-test every architecture but publish nothing -
+  # a dry run for the release pipeline without cutting a tag.
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          # Native ARM runner rather than cross-compiling, so the smoke test
+          # below actually executes the aarch64 binaries.
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     env:
-      TARGET: x86_64-unknown-linux-musl
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
 
@@ -20,20 +32,57 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           rustup target add "$TARGET"
 
       - name: Build
         run: cargo build --release --locked --target "$TARGET"
 
+      - name: Smoke test
+        run: |
+          bin="target/$TARGET/release"
+          file "$bin/attache-gate" | tee /dev/stderr | grep -q 'statically linked'
+          f="$(mktemp -u)"
+          printf 'run\n' | "$bin/attache-gate" duress-set "$f"
+          printf 'run\n' | "$bin/attache-gate" duress-check "$f"
+          ! printf 'nope\n' | "$bin/attache-gate" duress-check "$f"
+
+      - name: Stage binaries
+        run: |
+          mkdir stage
+          for b in attache-gate attache-mount-helper attache-import; do
+            install -m 755 "target/$TARGET/release/$b" "stage/$b-linux-${{ matrix.arch }}"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}
+          path: stage/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: dist
+
       - name: Assemble dist/
         run: |
-          mkdir dist
-          for b in attache-gate attache-mount-helper attache-import; do
-            install -m 755 "target/$TARGET/release/$b" "dist/$b"
-          done
+          chmod 755 dist/*
           install -m 755 att dist/att
           install -m 755 install-mount-helper.sh dist/install-mount-helper.sh
-          ( cd dist && sha256sum attache-gate attache-mount-helper attache-import att install-mount-helper.sh > SHA256SUMS )
+          ( cd dist && sha256sum * > SHA256SUMS )
           echo "--- SHA256SUMS ---"
           cat dist/SHA256SUMS
 
@@ -41,7 +90,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="Prebuilt static (musl) x86_64 Linux binaries, checksummed in \`SHA256SUMS\`.
+          notes="Prebuilt static (musl) Linux binaries for **x86_64** and **aarch64**, checksummed in \`SHA256SUMS\`. \`bootstrap.sh\` picks the right architecture:
 
           \`\`\`
           curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/bootstrap.sh | bash
