@@ -13,11 +13,10 @@ prompt (over SSH, headless), unapproved access is denied by default.
 The vault auto-closes after 5 minutes idle, at logout or shutdown, and before
 suspend.
 
-> **Status:** early, single-author project, not independently audited. It
-> performs privileged mount operations — read the code and the
+> **Status:** beta, single-author project, not independently audited. Do not
+> rely on it where your safety or freedom depends on it. It performs privileged
+> mount operations — read the code, the [safety notes](#safety-notes) and the
 > [threat model](#threat-model) before trusting it with anything that matters.
-> **If your safety depends on it, read [If you are at risk](#if-you-are-at-risk)
-> first.**
 
 ## Quick start
 
@@ -149,13 +148,11 @@ What it does **not** protect against:
 - **Malware running as you.** It could read the real password as you type it;
   nothing in this tool defends against that.
 
-## If you are at risk
+## Safety notes
 
-Attaché was written with people in mind who may be forced to hand over their
-devices or passwords: activists, journalists, and people living under
-authoritarian governments or with an abusive partner. If that is you, these are
-the limits you need to know about. No tool makes you safe on its own. Read
-this whole section before relying on it.
+What Attaché does and does not protect, and what the rest of the system has to
+provide. Attaché is beta software: these notes describe its limits, they are
+not a guarantee that it works as intended.
 
 ### Encrypt the whole disk first
 
@@ -207,11 +204,9 @@ TRIM enabled (the `discard` mount option or `fstrim.timer`).
   plainly show that an encrypted vault exists. After a duress open, the vault
   is empty and freshly created. An adversary who expected to find something
   may not believe it.
-- **Destroying data can make things worse.** In many countries, destroying
-  data that is wanted as evidence is a crime in its own right, sometimes
-  punished more heavily than what the data contained. An adversary who
-  realises you wiped something may react with more force. Only you can weigh
-  this. Decide calmly in advance, not under pressure.
+- **Destroying data can have consequences.** In many jurisdictions, destroying
+  data that is wanted as evidence is an offence in its own right. Whoever
+  asked for the password may also notice that the vault was wiped.
 - **It only destroys this copy.** Exports, backups, synced copies, or a disk
   image the adversary already took are untouched.
 - **Practise first** on a throwaway vault, so you know exactly what it looks
@@ -225,8 +220,8 @@ TRIM enabled (the `discard` mount option or `fstrim.timer`).
   `HISTCONTROL=ignorespace`, start the command with a space).
 - Install from verified releases (check `SHA256SUMS`) or build from source, and
   keep the tool updated.
-- If someone may already have installed spyware on your computer, no
-  encryption tool helps: they can read your password as you type it.
+- Malware running on your computer can read your password as you type it; no
+  encryption tool protects against that.
 
 ## Threat model
 
